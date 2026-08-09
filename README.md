@@ -1,5 +1,7 @@
 # PNG Metadata GUI
 
+<img src="screenshot.webp" alt="PNG Metadata GUI showing a folder of ComfyUI images with pinned metadata columns, a preview, and the metadata tree" width="100%">
+
 A fast, cross-platform desktop viewer for PNG text chunks (`tEXt`, `zTXt`,
 `iTXt`), built for browsing ComfyUI and Stable Diffusion metadata.
 
