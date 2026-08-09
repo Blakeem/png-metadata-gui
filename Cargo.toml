@@ -2,9 +2,9 @@
 name = "png-metadata-gui"
 version = "0.1.0"
 edition = "2024"
-description = "Fast cross-platform GUI for browsing PNG text-chunk metadata (ComfyUI / Stable Diffusion) — folder table with pinnable fields, search, and a click-to-copy JSON tree"
+description = "Fast cross-platform GUI for browsing PNG text-chunk metadata from ComfyUI and Stable Diffusion images"
 license = "MIT"
-repository = "https://github.com/blakeem/png-metadata-gui"
+repository = "https://github.com/Blakeem/png-metadata-gui"
 readme = "README.md"
 keywords = ["png", "metadata", "comfyui", "stable-diffusion", "egui"]
 categories = ["multimedia::images", "gui"]
