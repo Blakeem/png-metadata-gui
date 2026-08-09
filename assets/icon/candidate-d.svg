@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256">
+  <!-- D: the PNG wordmark itself under glass, text rows beneath -->
+  <rect x="8" y="8" width="240" height="240" rx="52" fill="#10243a"/>
+  <circle cx="120" cy="118" r="82" fill="#0f172a"/>
+  <text x="120" y="122" font-family="Segoe UI, Arial, sans-serif" font-weight="700"
+        font-size="58" fill="#f8fafc" text-anchor="middle">PNG</text>
+  <rect x="84" y="140" width="72" height="11" rx="5.5" fill="#38bdf8"/>
+  <rect x="94" y="159" width="52" height="11" rx="5.5" fill="#64748b"/>
+  <circle cx="120" cy="118" r="82" fill="none" stroke="#e2e8f0" stroke-width="14"/>
+  <line x1="180" y1="178" x2="222" y2="220" stroke="#e2e8f0" stroke-width="25" stroke-linecap="round"/>
+</svg>

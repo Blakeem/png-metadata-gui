@@ -1,21 +1,32 @@
 //! Main application state and UI.
 //!
 //! Layout:
-//! - Top panel: open buttons, search box, pin chips.
-//! - Left panel: preview + metadata for the selected image (full tree,
-//!   search-match list, or pinned-only list).
+//! - Top panel: open buttons, search box, pin chips (plus a label editor row
+//!   while a pin is being renamed).
+//! - Left panel: preview + metadata for the selected image. The tree is the
+//!   only structural view: an active search prunes it to matching branches
+//!   (still collapsible); "Pinned only" swaps it for the pinned-value list.
 //! - Center panel: image table; one sortable column per pin, plus a Match
 //!   column while a search is active.
 //! - Bottom panel: status line.
 //!
-//! Pins come in two forms: a bare key (`cfg`) matches every direct leaf with
-//! that key name across all metadata styles; an exact path
-//! (`prompt.183.inputs.cfg`) matches only that location. Multiple matches in
-//! one image render as color-coded values in document order.
+//! A pin selects rows by `pattern` + [`PinMode`]: a bare key (`cfg`) matches
+//! every direct leaf with that key name; an exact path
+//! (`prompt.183.inputs.cfg`) matches only that location; a title pin
+//! ("Positive Prompt") matches the `inputs.*` values of every ComfyUI node
+//! whose `_meta.title` contains the pattern — stable across workflows whose
+//! node ids differ. Typed pins get `Auto` (key ∪ title). A pin may carry a
+//! display `label` shown everywhere the pin appears; matching always uses
+//! `pattern`. Multiple matches render color-coded in document order. Title
+//! matching is gated by the ComfyUI-titles setting (⚙ in the toolbar).
+//!
+//! The find box in the metadata panel jumps to a field: it force-opens the
+//! headers on the path to the first key/value match and scrolls to it (a hit
+//! inside `_meta` retargets to the whole owning node); Enter cycles matches.
 
 use std::cmp::Ordering;
-use std::collections::HashMap;
-use std::path::PathBuf;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use eframe::egui::{
@@ -25,8 +36,10 @@ use eframe::egui::{
 use egui_extras::{Column, TableBuilder};
 use serde_json::Value;
 
-use crate::index::ChunkPayload;
-use crate::model::{human_size, ImageEntry};
+use crate::cache;
+use crate::index::{self, ChunkPayload};
+use crate::model::{human_size, ImageEntry, ParsedChunk, PinMode};
+use crate::scan::{ScanEvent, ScanTarget, Scanner};
 use crate::thumbs::ThumbPool;
 
 const DEFAULT_PINS: [&str; 9] = [
@@ -40,11 +53,102 @@ const DEFAULT_PINS: [&str; 9] = [
     "created",
     "modified",
 ];
-const PINS_STORAGE_KEY: &str = "pins_v3";
+const PINS_STORAGE_KEY: &str = "pins_v4";
+/// v3 stored plain pattern strings; v4 stores [`Pin`] structs with labels.
+const LEGACY_PINS_STORAGE_KEY: &str = "pins_v3";
+const SETTINGS_STORAGE_KEY: &str = "settings_v1";
 const ROW_HEIGHT: f32 = 52.0;
 const THUMB_CELL: f32 = 48.0;
 const FLASH_SECONDS: f32 = 2.5;
 const MAX_CELL_MATCHES: usize = 3;
+/// Upper bound on live thumbnail textures. A folder of several thousand PNGs
+/// would otherwise pin gigabytes of GPU memory. Eviction is least-recently-
+/// drawn, so it can only ever take an off-screen texture; evicted rows
+/// re-request their thumbnail when they scroll back into view.
+const MAX_TEXTURES: usize = 512;
+
+/// A pinned table column. `pattern` + `mode` select rows (see the module
+/// docs); `label`, when set, replaces the derived name in chips, table
+/// headers, and the pinned list.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+struct Pin {
+    pattern: String,
+    label: Option<String>,
+    /// `serde(default)` keeps pins saved before title pins existed loading as
+    /// plain key pins.
+    #[serde(default)]
+    mode: PinMode,
+}
+
+impl Pin {
+    fn key(pattern: &str) -> Self {
+        Self {
+            pattern: pattern.to_string(),
+            label: None,
+            mode: PinMode::Key,
+        }
+    }
+
+    /// Typed pins: the user may have entered a key or a node title.
+    fn auto(pattern: &str) -> Self {
+        Self {
+            pattern: pattern.to_string(),
+            label: None,
+            mode: PinMode::Auto,
+        }
+    }
+
+    fn title(title: String) -> Self {
+        Self {
+            pattern: title.clone(),
+            label: Some(title),
+            mode: PinMode::Title,
+        }
+    }
+}
+
+fn default_pins() -> Vec<Pin> {
+    DEFAULT_PINS.iter().map(|p| Pin::key(p)).collect()
+}
+
+/// User-configurable options, persisted via eframe storage. `serde(default)`
+/// lets fields be added later without invalidating stored settings.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+struct Settings {
+    /// Title pins match ComfyUI `_meta.title` (substring) and show the node's
+    /// `inputs` values; pinning a titled value from the tree pins its title
+    /// instead of its node-id path. Inert for files without that structure.
+    comfyui_titles: bool,
+    /// The folder to reopen at launch when no path was passed on the
+    /// command line. Updated on every folder open.
+    last_folder: Option<PathBuf>,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            comfyui_titles: true,
+            last_folder: None,
+        }
+    }
+}
+
+/// Progress of the scan currently streaming into the table. `total` is
+/// `None` until the worker finishes listing the directory.
+struct ScanState {
+    generation: u64,
+    done: usize,
+    total: Option<usize>,
+}
+
+/// In-progress pin label edit, shown as an extra toolbar row.
+struct PinRename {
+    pin_index: usize,
+    draft: String,
+    /// Focus the text box on the first frame it appears.
+    needs_focus: bool,
+}
 
 #[derive(Clone, Copy, PartialEq)]
 enum SortColumn {
@@ -63,13 +167,22 @@ struct MatchInfo {
 struct UiActions {
     select: Option<usize>,
     sort: Option<SortColumn>,
-    toggle_pin: Option<String>,
+    toggle_pin: Option<Pin>,
     move_pin: Option<(usize, isize)>,
     unpin: Option<usize>,
+    start_rename: Option<usize>,
+    apply_rename: Option<(usize, String)>,
+    cancel_rename: bool,
     copy: Option<(String, String)>, // (label, clipboard content)
     set_tree_expanded: Option<bool>,
+    toggle_settings: bool,
     open_folder_dialog: bool,
     open_file_dialog: bool,
+    /// Thumbnails a widget found missing this frame (never decoded, or evicted).
+    request_thumbs: Vec<PathBuf>,
+    /// Thumbnails a widget actually drew this frame, in draw order. Keeps them
+    /// at the back of `texture_order` so the cap never evicts a visible one.
+    used_thumbs: Vec<PathBuf>,
 }
 
 pub struct ViewerApp {
@@ -78,8 +191,16 @@ pub struct ViewerApp {
     folder: Option<PathBuf>,
     selected: Option<usize>,
     search: String,
-    pins: Vec<String>,
+    pins: Vec<Pin>,
+    rename: Option<PinRename>,
     new_pin: String,
+    settings: Settings,
+    settings_open: bool,
+    /// Find box in the metadata panel: query text plus the rotating index
+    /// that lets repeated Enter presses cycle through matches.
+    find_text: String,
+    find_last_query: String,
+    find_index: usize,
     pinned_only: bool,
     sort: Option<(SortColumn, bool)>,
     visible: Vec<usize>,
@@ -87,8 +208,17 @@ pub struct ViewerApp {
     needs_refresh: bool,
     /// One-frame override forcing every tree section open or closed.
     force_tree_expanded: Option<bool>,
+    scanner: Scanner,
+    scanning: Option<ScanState>,
     thumbs: ThumbPool,
     textures: HashMap<PathBuf, TextureHandle>,
+    /// Draw order of `textures`, least recently drawn first. The cap evicts
+    /// from the front; drawing a thumbnail moves it to the back in
+    /// `apply_actions`, so on-screen textures are never the eviction candidate.
+    texture_order: VecDeque<PathBuf>,
+    /// Paths whose decode failed. Without this, the re-request-on-miss path
+    /// would retry an undecodable file every frame, forever.
+    failed_thumbs: HashSet<PathBuf>,
     flash: Option<(String, Instant)>,
     pending_copy: Option<String>,
 }
@@ -97,8 +227,20 @@ impl ViewerApp {
     pub fn new(cc: &eframe::CreationContext<'_>, initial_target: Option<PathBuf>) -> Self {
         let pins = cc
             .storage
-            .and_then(|storage| eframe::get_value::<Vec<String>>(storage, PINS_STORAGE_KEY))
-            .unwrap_or_else(|| DEFAULT_PINS.iter().map(|p| p.to_string()).collect());
+            .and_then(|storage| eframe::get_value::<Vec<Pin>>(storage, PINS_STORAGE_KEY))
+            .or_else(|| {
+                // Migrate v3 pattern-only pins into label-less v4 pins.
+                cc.storage
+                    .and_then(|storage| {
+                        eframe::get_value::<Vec<String>>(storage, LEGACY_PINS_STORAGE_KEY)
+                    })
+                    .map(|patterns| patterns.iter().map(|p| Pin::key(p)).collect())
+            })
+            .unwrap_or_else(default_pins);
+        let settings = cc
+            .storage
+            .and_then(|storage| eframe::get_value::<Settings>(storage, SETTINGS_STORAGE_KEY))
+            .unwrap_or_default();
 
         let mut app = Self {
             images: Vec::new(),
@@ -107,19 +249,36 @@ impl ViewerApp {
             selected: None,
             search: String::new(),
             pins,
+            rename: None,
             new_pin: String::new(),
+            settings,
+            settings_open: false,
+            find_text: String::new(),
+            find_last_query: String::new(),
+            find_index: 0,
             pinned_only: false,
             sort: None,
             visible: Vec::new(),
             matches: HashMap::new(),
             needs_refresh: false,
             force_tree_expanded: None,
+            scanner: Scanner::new(cc.egui_ctx.clone()),
+            scanning: None,
             thumbs: ThumbPool::new(cc.egui_ctx.clone()),
             textures: HashMap::new(),
+            texture_order: VecDeque::new(),
+            failed_thumbs: HashSet::new(),
             flash: None,
             pending_copy: None,
         };
-        if let Some(target) = initial_target {
+        // A command-line path wins; otherwise reopen the last folder.
+        let startup_target = initial_target.or_else(|| {
+            app.settings
+                .last_folder
+                .clone()
+                .filter(|dir| dir.is_dir())
+        });
+        if let Some(target) = startup_target {
             app.open_target(target);
         }
         app
@@ -131,46 +290,63 @@ impl ViewerApp {
         if target.is_dir() {
             self.open_folder(target);
         } else {
-            self.load_paths(vec![target]);
+            self.open_files(vec![target]);
         }
     }
 
     fn open_folder(&mut self, dir: PathBuf) {
-        let mut paths: Vec<PathBuf> = std::fs::read_dir(&dir)
-            .map(|entries| {
-                entries
-                    .filter_map(|e| e.ok())
-                    .map(|e| e.path())
-                    .filter(|p| {
-                        p.extension()
-                            .is_some_and(|ext| ext.eq_ignore_ascii_case("png"))
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-        paths.sort();
-        self.folder = Some(dir);
-        self.load_paths(paths);
+        self.folder = Some(dir.clone());
+        self.settings.last_folder = Some(dir.clone());
+        self.begin_scan(ScanTarget::Folder(dir));
     }
 
-    fn load_paths(&mut self, paths: Vec<PathBuf>) {
+    fn open_files(&mut self, paths: Vec<PathBuf>) {
+        self.folder = None;
+        self.begin_scan(ScanTarget::Files(paths));
+    }
+
+    /// Clears the current view and hands the target to the background
+    /// scanner; entries stream back through [`ScanEvent`] messages.
+    fn begin_scan(&mut self, target: ScanTarget) {
         self.images.clear();
         self.load_errors.clear();
         self.textures.clear();
+        self.texture_order.clear();
+        self.failed_thumbs.clear();
         self.selected = None;
-        for path in paths {
-            match ImageEntry::load(path.clone()) {
-                Ok(entry) => {
-                    self.thumbs.request(path);
-                    self.images.push(entry);
+        self.needs_refresh = true;
+        let generation = self.scanner.start(target, cache::default_cache_dir());
+        self.scanning = Some(ScanState {
+            generation,
+            done: 0,
+            total: None,
+        });
+    }
+
+    /// Applies the scanner's streamed messages. Messages from a superseded
+    /// scan (older generation) are dropped.
+    fn poll_scanner(&mut self) {
+        for update in self.scanner.poll() {
+            let Some(state) = &mut self.scanning else {
+                continue;
+            };
+            if update.generation != state.generation {
+                continue;
+            }
+            match update.event {
+                ScanEvent::Started { total } => state.total = Some(total),
+                ScanEvent::Entry(entry) => {
+                    state.done += 1;
+                    self.images.push(*entry);
+                    self.needs_refresh = true;
                 }
-                Err(err) => self.load_errors.push(format!("{}: {err}", path.display())),
+                ScanEvent::Error(err) => {
+                    state.done += 1;
+                    self.load_errors.push(err);
+                }
+                ScanEvent::Done => self.scanning = None,
             }
         }
-        if !self.images.is_empty() {
-            self.selected = Some(0);
-        }
-        self.needs_refresh = true;
     }
 
     fn open_dropped(&mut self, dropped: Vec<PathBuf>) {
@@ -186,12 +362,15 @@ impl ViewerApp {
                         .is_some_and(|ext| ext.eq_ignore_ascii_case("png"))
             })
             .collect();
+        if pngs.is_empty() {
+            // Nothing openable in the drop: keep the current folder instead of
+            // silently resetting the view to an empty scan.
+            self.flash = Some(("No PNG files in drop".to_string(), Instant::now()));
+            return;
+        }
         match pngs.iter().find(|p| p.is_dir()) {
             Some(dir) => self.open_folder(dir.clone()),
-            None => {
-                self.folder = None;
-                self.load_paths(pngs);
-            }
+            None => self.open_files(pngs),
         }
     }
 
@@ -218,12 +397,7 @@ impl ViewerApp {
             .collect();
 
         if let Some((column, ascending)) = self.sort {
-            let images = &self.images;
-            let pins = &self.pins;
-            self.visible.sort_by(|&a, &b| {
-                let ord = compare_entries(&images[a], &images[b], column, pins);
-                if ascending { ord } else { ord.reverse() }
-            });
+            self.sort_visible(column, ascending);
         }
 
         let selection_visible = self
@@ -231,6 +405,38 @@ impl ViewerApp {
             .is_some_and(|sel| self.visible.contains(&sel));
         if !selection_visible {
             self.selected = self.visible.first().copied();
+        }
+    }
+
+    /// Sorts `visible` by the active column. A pin sort decorates each entry
+    /// with its first match once (one `rows_for_pin` per entry) instead of
+    /// re-scanning both entries inside every comparison.
+    fn sort_visible(&mut self, column: SortColumn, ascending: bool) {
+        let images = &self.images;
+        match column {
+            SortColumn::Name => self.visible.sort_by(|&a, &b| {
+                let ord = images[a].file_name_lc.cmp(&images[b].file_name_lc);
+                if ascending { ord } else { ord.reverse() }
+            }),
+            SortColumn::Pin(pin_idx) => {
+                let Some(pin) = self.pins.get(pin_idx) else {
+                    return;
+                };
+                let use_titles = self.settings.comfyui_titles;
+                let mut decorated: Vec<(Option<&crate::index::MetaRow>, usize)> = self
+                    .visible
+                    .iter()
+                    .map(|&idx| {
+                        let rows = images[idx].rows_for_pin(&pin.pattern, pin.mode, use_titles);
+                        (rows.first().copied(), idx)
+                    })
+                    .collect();
+                decorated.sort_by(|&(a, _), &(b, _)| {
+                    let ord = compare_pin_matches(a, b);
+                    if ascending { ord } else { ord.reverse() }
+                });
+                self.visible = decorated.into_iter().map(|(_, idx)| idx).collect();
+            }
         }
     }
 
@@ -246,17 +452,18 @@ impl ViewerApp {
             };
             self.needs_refresh = true;
         }
-        if let Some(key) = actions.toggle_pin {
+        if let Some(pin) = actions.toggle_pin {
             let existing = self
                 .pins
                 .iter()
-                .position(|p| p.eq_ignore_ascii_case(&key));
+                .position(|p| p.pattern.eq_ignore_ascii_case(&pin.pattern));
             match existing {
                 Some(idx) => {
                     _ = self.pins.remove(idx);
                 }
-                None => self.pins.push(key),
+                None => self.pins.push(pin),
             }
+            self.rename = None;
             self.sort = None;
             self.needs_refresh = true;
         }
@@ -264,6 +471,7 @@ impl ViewerApp {
             let target = idx as isize + delta;
             if target >= 0 && (target as usize) < self.pins.len() {
                 self.pins.swap(idx, target as usize);
+                self.rename = None;
                 self.sort = None;
                 self.needs_refresh = true;
             }
@@ -272,8 +480,28 @@ impl ViewerApp {
             && idx < self.pins.len()
         {
             _ = self.pins.remove(idx);
+            self.rename = None;
             self.sort = None;
             self.needs_refresh = true;
+        }
+        if let Some(idx) = actions.start_rename
+            && idx < self.pins.len()
+        {
+            self.rename = Some(PinRename {
+                pin_index: idx,
+                draft: self.pins[idx].label.clone().unwrap_or_default(),
+                needs_focus: true,
+            });
+        }
+        if let Some((idx, label)) = actions.apply_rename {
+            if idx < self.pins.len() {
+                let trimmed = label.trim();
+                self.pins[idx].label = (!trimmed.is_empty()).then(|| trimmed.to_string());
+            }
+            self.rename = None;
+        }
+        if actions.cancel_rename {
+            self.rename = None;
         }
         if let Some((label, content)) = actions.copy {
             self.flash = Some((format!("Copied {label}"), Instant::now()));
@@ -281,6 +509,22 @@ impl ViewerApp {
         }
         if let Some(expanded) = actions.set_tree_expanded {
             self.force_tree_expanded = Some(expanded);
+        }
+        if actions.toggle_settings {
+            self.settings_open = !self.settings_open;
+        }
+        for path in actions.request_thumbs {
+            // Already-in-flight paths are no-ops, so re-asking every frame is
+            // cheap; paths whose decode already failed must never be re-asked.
+            if !self.failed_thumbs.contains(&path) {
+                self.thumbs.request(path);
+            }
+        }
+        // Thumbnails drawn this frame become the most recently used: move them
+        // to the back of `texture_order` so the cap evicts an off-screen
+        // texture rather than one the user is looking at.
+        if !actions.used_thumbs.is_empty() {
+            touch_texture_order(&mut self.texture_order, &self.textures, &actions.used_thumbs);
         }
         if actions.open_folder_dialog
             && let Some(dir) = rfd::FileDialog::new().pick_folder()
@@ -292,8 +536,7 @@ impl ViewerApp {
                 .add_filter("PNG images", &["png"])
                 .pick_files()
         {
-            self.folder = None;
-            self.load_paths(files);
+            self.open_files(files);
         }
     }
 
@@ -325,7 +568,7 @@ fn match_image(entry: &ImageEntry, query: &str) -> Option<MatchInfo> {
         count += 1;
     }
     for row in &entry.rows {
-        if row.path_lc.contains(query) || row.value_lc.contains(query) {
+        if index::row_matches(row, query) {
             if first.is_none() {
                 first = Some(format!("{} = {}", row.key, single_line(&row.value, 200)));
             }
@@ -335,22 +578,17 @@ fn match_image(entry: &ImageEntry, query: &str) -> Option<MatchInfo> {
     first.map(|first| MatchInfo { first, count })
 }
 
-fn compare_entries(a: &ImageEntry, b: &ImageEntry, column: SortColumn, pins: &[String]) -> Ordering {
-    match column {
-        SortColumn::Name => a.file_name_lc.cmp(&b.file_name_lc),
-        SortColumn::Pin(pin_idx) => {
-            let Some(pin) = pins.get(pin_idx) else {
-                return Ordering::Equal;
-            };
-            let rows_a = a.rows_for_pin(pin);
-            let rows_b = b.rows_for_pin(pin);
-            match (rows_a.first(), rows_b.first()) {
-                (Some(x), Some(y)) => compare_rows(x, y),
-                (Some(_), None) => Ordering::Less,
-                (None, Some(_)) => Ordering::Greater,
-                (None, None) => Ordering::Equal,
-            }
-        }
+/// Orders two entries by their first match for the sorted pin column; entries
+/// with no match sort last (before the ascending/descending flip).
+fn compare_pin_matches(
+    a: Option<&crate::index::MetaRow>,
+    b: Option<&crate::index::MetaRow>,
+) -> Ordering {
+    match (a, b) {
+        (Some(x), Some(y)) => compare_rows(x, y),
+        (Some(_), None) => Ordering::Less,
+        (None, Some(_)) => Ordering::Greater,
+        (None, None) => Ordering::Equal,
     }
 }
 
@@ -370,24 +608,42 @@ fn compare_values(a: &str, b: &str) -> Ordering {
 }
 
 fn single_line(text: &str, max_chars: usize) -> String {
-    let mut out: String = text
-        .chars()
-        .map(|c| if c == '\n' || c == '\r' { ' ' } else { c })
-        .take(max_chars)
-        .collect();
-    if text.chars().count() > max_chars {
+    let mut chars = text.chars();
+    let mut out = String::new();
+    for c in chars.by_ref().take(max_chars) {
+        out.push(if c == '\n' || c == '\r' { ' ' } else { c });
+    }
+    // One pass: the iterator is left just past the kept characters, so a
+    // remaining character means the text was truncated.
+    if chars.next().is_some() {
         out.push('…');
     }
     out
 }
 
-/// Display form of a pin: bare keys show as-is; exact-path pins show a
-/// location marker plus the final segment (full path in tooltips).
-fn pin_label(pin: &str) -> String {
-    match pin.rsplit_once('.') {
-        Some((_, last)) => format!("⌖ {last}"),
-        None => pin.to_string(),
+/// Display form of a pin: an explicit label wins; otherwise bare keys show
+/// as-is and exact-path pins show a location marker plus the final segment
+/// (full pattern in tooltips).
+fn pin_label(pin: &Pin) -> String {
+    if let Some(label) = &pin.label {
+        return label.clone();
     }
+    match pin.pattern.rsplit_once('.') {
+        Some((_, last)) => format!("⌖ {last}"),
+        None => pin.pattern.clone(),
+    }
+}
+
+/// Full-value hover text, capped so multi-kilobyte prompts don't fill the
+/// screen; the copy actions always carry the complete value.
+fn tooltip_excerpt(value: &str) -> String {
+    const MAX_CHARS: usize = 1200;
+    let total = value.chars().count();
+    if total <= MAX_CHARS {
+        return value.to_string();
+    }
+    let head: String = value.chars().take(MAX_CHARS).collect();
+    format!("{head}…\n\n({} more characters — copy for the full value)", total - MAX_CHARS)
 }
 
 /// Stable color per match ordinal, so "first cfg" and "second cfg" (e.g.
@@ -403,19 +659,39 @@ fn ordinal_color(ui: &Ui, ordinal: usize) -> Color32 {
 impl eframe::App for ViewerApp {
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
         eframe::set_value(storage, PINS_STORAGE_KEY, &self.pins);
+        eframe::set_value(storage, SETTINGS_STORAGE_KEY, &self.settings);
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         let force_tree = self.force_tree_expanded.take();
 
-        // Upload finished thumbnails.
-        for (path, image) in self.thumbs.poll() {
-            if let Some(image) = image {
+        self.poll_scanner();
+
+        // Upload finished thumbnails. Eviction runs after every insert, not
+        // once per batch: a stalled UI thread (blocked file dialog, window
+        // drag) lets thousands of queued decodes arrive in one poll, and a
+        // batch-level sweep would upload them all before trimming — the exact
+        // multi-gigabyte spike `MAX_TEXTURES` exists to prevent.
+        let finished = self.thumbs.poll();
+        if !finished.is_empty() {
+            let current: HashSet<&Path> = self.images.iter().map(|e| e.path.as_path()).collect();
+            for (path, image) in finished {
+                // A decode still in flight when the folder changed belongs to
+                // no listed image; dropping it keeps `textures` in step.
+                if !current.contains(path.as_path()) {
+                    continue;
+                }
+                let Some(image) = image else {
+                    _ = self.failed_thumbs.insert(path);
+                    continue;
+                };
                 let name = path.to_string_lossy().into_owned();
-                _ = self
-                    .textures
-                    .insert(path, ctx.load_texture(name, image, TextureOptions::LINEAR));
+                let texture = ctx.load_texture(name, image, TextureOptions::LINEAR);
+                if self.textures.insert(path.clone(), texture).is_none() {
+                    self.texture_order.push_back(path);
+                }
+                evict_stale_textures(&mut self.texture_order, &mut self.textures, MAX_TEXTURES);
             }
         }
 
@@ -472,12 +748,47 @@ impl eframe::App for ViewerApp {
             });
 
         _ = egui::CentralPanel::default().show(ui, |ui| {
-            if self.images.is_empty() {
-                empty_state_ui(ui, &mut actions);
-            } else {
+            if !self.images.is_empty() {
                 self.table_ui(ui, &mut actions);
+            } else if let Some(state) = &self.scanning {
+                loading_state_ui(ui, state);
+            } else {
+                empty_state_ui(ui, &mut actions);
             }
         });
+
+        if self.settings_open {
+            // `open` is a local so the window's close button doesn't need a
+            // second mutable borrow of self alongside the checkbox binding.
+            let mut open = self.settings_open;
+            let mut changed = false;
+            _ = egui::Window::new("Settings")
+                .open(&mut open)
+                .collapsible(false)
+                .resizable(false)
+                .show(&ctx, |ui| {
+                    changed |= ui
+                        .checkbox(&mut self.settings.comfyui_titles, "ComfyUI title pins")
+                        .changed();
+                    ui.set_max_width(320.0);
+                    _ = ui.label(
+                        RichText::new(
+                            "Pins can match nodes by their _meta.title (substring) and \
+                             show that node's input values — stable across workflows \
+                             whose node ids differ. Pinning a titled value from the \
+                             tree pins the title; typed pins match keys and titles. \
+                             Has no effect on files without ComfyUI structure.",
+                        )
+                        .weak()
+                        .small(),
+                    );
+                });
+            self.settings_open = open;
+            if changed {
+                // Title matching feeds pin columns and pin-column sorts.
+                self.needs_refresh = true;
+            }
+        }
 
         self.apply_actions(actions);
         if let Some(content) = self.take_pending_copy() {
@@ -509,7 +820,7 @@ impl ViewerApp {
             _ = ui.label("Search:");
             let response = ui.add(
                 egui::TextEdit::singleline(&mut self.search)
-                    .hint_text("key, path, or value…")
+                    .hint_text("key, value, or dotted.path…")
                     .desired_width(220.0),
             );
             if response.changed() {
@@ -527,10 +838,21 @@ impl ViewerApp {
 
             _ = ui.label("Pins:");
             for (idx, pin) in self.pins.iter().enumerate() {
+                let mode_note = match pin.mode {
+                    PinMode::Title => "ComfyUI node title",
+                    _ if pin.pattern.contains('.') => "exact path",
+                    PinMode::Key => "key",
+                    PinMode::Auto => "key or node title",
+                };
                 let chip = ui.small_button(pin_label(pin)).on_hover_text(format!(
-                    "{pin}\n\nColumn in the table, in this order.\nRight-click to reorder or unpin.",
+                    "{}  ({mode_note})\n\nColumn in the table, in this order.\nRight-click to rename, reorder, or unpin.",
+                    pin.pattern,
                 ));
                 _ = chip.context_menu(|ui| {
+                    if ui.button("✏ Rename…").clicked() {
+                        actions.start_rename = Some(idx);
+                        ui.close();
+                    }
                     if ui.button("◀ Move left").clicked() {
                         actions.move_pin = Some((idx, -1));
                         ui.close();
@@ -545,17 +867,59 @@ impl ViewerApp {
                     }
                 });
             }
+            let pin_hint = if self.settings.comfyui_titles {
+                "add pin (key or node title)…"
+            } else {
+                "add pin…"
+            };
             let pin_edit = ui.add(
                 egui::TextEdit::singleline(&mut self.new_pin)
-                    .hint_text("add pin…")
-                    .desired_width(80.0),
+                    .hint_text(pin_hint)
+                    .desired_width(120.0),
             );
             let submitted =
                 pin_edit.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
             if submitted && !self.new_pin.trim().is_empty() {
-                actions.toggle_pin = Some(self.new_pin.trim().to_string());
+                actions.toggle_pin = Some(Pin::auto(self.new_pin.trim()));
                 self.new_pin.clear();
                 pin_edit.request_focus();
+            }
+            if ui.button("⚙").on_hover_text("Settings").clicked() {
+                actions.toggle_settings = true;
+            }
+        });
+        self.rename_row_ui(ui, actions);
+    }
+
+    /// Label editor row, shown under the toolbar while a pin rename is open.
+    fn rename_row_ui(&mut self, ui: &mut Ui, actions: &mut UiActions) {
+        let Some(rename) = &mut self.rename else {
+            return;
+        };
+        let pattern = self
+            .pins
+            .get(rename.pin_index)
+            .map(|p| p.pattern.clone())
+            .unwrap_or_default();
+        _ = ui.horizontal(|ui| {
+            _ = ui.label(format!("Label for '{pattern}':"));
+            let edit = ui.add(
+                egui::TextEdit::singleline(&mut rename.draft)
+                    .hint_text("display name (empty = default)")
+                    .desired_width(200.0),
+            );
+            if rename.needs_focus {
+                edit.request_focus();
+                rename.needs_focus = false;
+            }
+            let submitted = edit.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
+            let apply_clicked = ui.small_button("Apply").clicked();
+            let cancel_clicked = ui.small_button("Cancel").clicked();
+            if submitted || apply_clicked {
+                actions.apply_rename = Some((rename.pin_index, rename.draft.clone()));
+            }
+            if cancel_clicked || ui.input(|i| i.key_pressed(Key::Escape)) {
+                actions.cancel_rename = true;
             }
         });
     }
@@ -572,6 +936,17 @@ impl ViewerApp {
                 self.visible.len(),
                 self.images.len()
             ));
+            if let Some(state) = &self.scanning {
+                _ = ui.separator();
+                _ = ui.spinner();
+                _ = match state.total {
+                    Some(total) => ui.label(format!(
+                        "reading metadata {} / {total}…",
+                        state.done
+                    )),
+                    None => ui.label("listing folder…"),
+                };
+            }
             if self.thumbs.pending() > 0 {
                 _ = ui.separator();
                 _ = ui.spinner();
@@ -604,6 +979,7 @@ impl ViewerApp {
         // Preview block.
         let preview_path = self.images[selected].path.clone();
         if let Some(texture) = self.textures.get(&preview_path) {
+            actions.used_thumbs.push(preview_path.clone());
             let available = ui.available_width();
             _ = ui.vertical_centered(|ui| {
                 _ = ui.add(
@@ -612,6 +988,7 @@ impl ViewerApp {
                 );
             });
         } else {
+            actions.request_thumbs.push(preview_path.clone());
             _ = ui.vertical_centered(|ui| {
                 ui.add_space(100.0);
                 _ = ui.spinner();
@@ -636,10 +1013,13 @@ impl ViewerApp {
         });
         _ = ui.separator();
 
-        // View mode controls. Search overrides the checkbox; make that visible.
+        // View mode controls. The tree stays the structural view during a
+        // search (pruned to matches); "Pinned only" swaps in the pinned list.
         let query = self.search.trim().to_lowercase();
-        let tree_visible = query.is_empty() && !self.pinned_only;
-        _ = ui.horizontal(|ui| {
+        let searching = !query.is_empty();
+        let tree_visible = !self.pinned_only;
+        let mut find_requested = false;
+        _ = ui.horizontal_wrapped(|ui| {
             let checkbox = ui.checkbox(&mut self.pinned_only, "Pinned only");
             if checkbox.changed() {
                 ui.ctx().request_repaint();
@@ -657,22 +1037,81 @@ impl ViewerApp {
             {
                 actions.set_tree_expanded = Some(false);
             }
-            if !query.is_empty() {
-                _ = ui.label(RichText::new("showing search matches").weak());
+            _ = ui.separator();
+            _ = ui.label("Find:");
+            let find_edit = ui.add_enabled(
+                tree_visible,
+                egui::TextEdit::singleline(&mut self.find_text)
+                    .hint_text("jump to field…")
+                    .desired_width(110.0),
+            );
+            if find_edit.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
+                find_requested = true;
+                // Keep focus so Enter cycles onward through the matches.
+                find_edit.request_focus();
+            }
+            if searching {
+                let note = if self.pinned_only {
+                    "search filters the table only"
+                } else {
+                    "filtered by search"
+                };
+                _ = ui.label(RichText::new(note).weak());
             }
         });
         ui.add_space(2.0);
+
+        // Resolve a find request into this frame's jump target: the first
+        // (then next, on repeated Enter) row matching the find text; a hit
+        // inside `_meta` (usually the title) retargets to the owning node so
+        // the whole node — its inputs included — opens.
+        let mut jump: Option<String> = None;
+        if find_requested {
+            let find_query = self.find_text.trim().to_lowercase();
+            if !find_query.is_empty() {
+                if find_query != self.find_last_query {
+                    self.find_last_query = find_query.clone();
+                    self.find_index = 0;
+                }
+                let matched_paths: Vec<&str> = self.images[selected]
+                    .rows
+                    .iter()
+                    .filter(|row| index::row_matches(row, &find_query))
+                    .map(|row| row.path.as_str())
+                    .collect();
+                if matched_paths.is_empty() {
+                    self.flash = Some((
+                        format!("No match for '{}'", self.find_text.trim()),
+                        Instant::now(),
+                    ));
+                } else {
+                    let target = matched_paths[self.find_index % matched_paths.len()];
+                    let node = match target.find("._meta.") {
+                        Some(idx) => &target[..idx],
+                        None => target,
+                    };
+                    jump = Some(node.to_string());
+                    self.find_index = self.find_index.wrapping_add(1);
+                }
+            }
+        }
 
         let entry = &self.images[selected];
         _ = ScrollArea::vertical()
             .auto_shrink([false, false])
             .show(ui, |ui| {
-                if !query.is_empty() {
-                    match_list_ui(ui, entry, &query, actions);
-                } else if self.pinned_only {
-                    pinned_list_ui(ui, entry, &self.pins, actions);
+                if self.pinned_only {
+                    pinned_list_ui(ui, entry, &self.pins, self.settings.comfyui_titles, actions);
                 } else {
-                    chunk_tree_ui(ui, entry, &self.pins, force_tree, actions);
+                    let tree_ctx = TreeCtx {
+                        entry,
+                        pins: &self.pins,
+                        force_open: force_tree,
+                        query: &query,
+                        use_titles: self.settings.comfyui_titles,
+                        jump: jump.as_deref(),
+                    };
+                    chunk_tree_ui(ui, &tree_ctx, actions);
                 }
             });
     }
@@ -739,8 +1178,10 @@ impl ViewerApp {
                                     egui::Image::new(texture)
                                         .max_size(egui::vec2(THUMB_CELL, THUMB_CELL)),
                                 );
+                                actions.used_thumbs.push(entry.path.clone());
                             }
                             None => {
+                                actions.request_thumbs.push(entry.path.clone());
                                 _ = ui.spinner();
                             }
                         }
@@ -751,7 +1192,7 @@ impl ViewerApp {
                     });
                     for pin in &self.pins {
                         _ = row.col(|ui| {
-                            pin_cell_ui(ui, entry, pin, actions);
+                            pin_cell_ui(ui, entry, pin, self.settings.comfyui_titles, actions);
                         });
                     }
                     if has_search {
@@ -775,7 +1216,59 @@ impl ViewerApp {
     }
 }
 
+// ---- thumbnail cache bookkeeping (pure: no egui borrow) ----
+
+// Generic over the cached value so the ordering rules can be tested without a
+// render context to build a `TextureHandle` with.
+
+/// Moves the paths drawn this frame to the back of `order`, de-duplicated and
+/// in draw order. Paths absent from `live` are ignored, keeping `order` and
+/// `live` one-to-one.
+fn touch_texture_order<T>(
+    order: &mut VecDeque<PathBuf>,
+    live: &HashMap<PathBuf, T>,
+    drawn: &[PathBuf],
+) {
+    let mut seen: HashSet<&Path> = HashSet::new();
+    let mut ordered: Vec<PathBuf> = Vec::with_capacity(drawn.len());
+    for path in drawn {
+        if live.contains_key(path) && seen.insert(path.as_path()) {
+            ordered.push(path.clone());
+        }
+    }
+    order.retain(|path| !seen.contains(path.as_path()));
+    order.extend(ordered);
+}
+
+/// Drops least-recently-drawn entries until at most `cap` remain.
+fn evict_stale_textures<T>(
+    order: &mut VecDeque<PathBuf>,
+    live: &mut HashMap<PathBuf, T>,
+    cap: usize,
+) {
+    while order.len() > cap {
+        let Some(oldest) = order.pop_front() else {
+            break;
+        };
+        _ = live.remove(&oldest);
+    }
+}
+
 // ---- widget helpers (free functions: no app borrow) ----
+
+/// Central-panel placeholder while a scan runs and nothing has arrived yet.
+fn loading_state_ui(ui: &mut Ui, state: &ScanState) {
+    _ = ui.vertical_centered(|ui| {
+        ui.add_space(ui.available_height() * 0.35);
+        _ = ui.spinner();
+        ui.add_space(8.0);
+        let text = match state.total {
+            Some(total) => format!("Reading metadata… {} / {total}", state.done),
+            None => "Reading folder…".to_string(),
+        };
+        _ = ui.label(RichText::new(text).size(16.0).weak());
+    });
+}
 
 fn empty_state_ui(ui: &mut Ui, actions: &mut UiActions) {
     _ = ui.vertical_centered(|ui| {
@@ -812,19 +1305,18 @@ fn sort_header_ui(
 
 /// Table cell for one pin: every match in document order, color-coded by
 /// ordinal so repeated keys (generation vs upscale cfg) stay tellable apart.
-fn pin_cell_ui(ui: &mut Ui, entry: &ImageEntry, pin: &str, actions: &mut UiActions) {
-    let matches = entry.rows_for_pin(pin);
+fn pin_cell_ui(
+    ui: &mut Ui,
+    entry: &ImageEntry,
+    pin: &Pin,
+    use_titles: bool,
+    actions: &mut UiActions,
+) {
+    let matches = entry.rows_for_pin(&pin.pattern, pin.mode, use_titles);
     if matches.is_empty() {
         _ = ui.label(RichText::new("—").weak());
         return;
     }
-    let tooltip: String = matches
-        .iter()
-        .enumerate()
-        .map(|(i, row)| format!("{}. {} = {}", i + 1, row.path, single_line(&row.value, 200)))
-        .collect::<Vec<_>>()
-        .join("\n")
-        + "\n\n(click a value to copy it)";
     for (i, row) in matches.iter().take(MAX_CELL_MATCHES).enumerate() {
         if i > 0 {
             _ = ui.label(RichText::new("·").weak());
@@ -835,9 +1327,21 @@ fn pin_cell_ui(ui: &mut Ui, entry: &ImageEntry, pin: &str, actions: &mut UiActio
                 Label::new(RichText::new(single_line(&row.value, 28)).monospace().color(color))
                     .sense(Sense::click()),
             )
-            .on_hover_text(tooltip.clone());
+            // Built inside the hover closure: every visible cell would
+            // otherwise format every match on every frame.
+            .on_hover_ui(|ui| {
+                ui.set_max_width(ui.spacing().tooltip_width);
+                let tooltip: String = matches
+                    .iter()
+                    .enumerate()
+                    .map(|(n, r)| format!("{}. {} = {}", n + 1, r.path, single_line(&r.value, 200)))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+                    + "\n\n(click a value to copy it)";
+                _ = ui.label(tooltip);
+            });
         if response.clicked() {
-            actions.copy = Some((pin.to_string(), row.value.clone()));
+            actions.copy = Some((pin_label(pin), row.value.clone()));
         }
     }
     if matches.len() > MAX_CELL_MATCHES {
@@ -845,28 +1349,15 @@ fn pin_cell_ui(ui: &mut Ui, entry: &ImageEntry, pin: &str, actions: &mut UiActio
     }
 }
 
-fn match_list_ui(ui: &mut Ui, entry: &ImageEntry, query: &str, actions: &mut UiActions) {
-    let mut shown = 0usize;
-    if entry.file_name_lc.contains(query) {
-        _ = ui.label(RichText::new("file name matches").weak().small());
-        shown += 1;
-    }
-    for row in &entry.rows {
-        if row.path_lc.contains(query) || row.value_lc.contains(query) {
-            _ = ui.label(RichText::new(&row.path).weak().small());
-            value_label_ui(ui, &row.key, &row.value, actions);
-            ui.add_space(4.0);
-            shown += 1;
-        }
-    }
-    if shown == 0 {
-        _ = ui.label(RichText::new("No matches in this image").weak());
-    }
-}
-
 /// Pinned-only view: one card per pin — pin name, then each matching value
-/// (ordinal-colored, click to copy) with its location underneath.
-fn pinned_list_ui(ui: &mut Ui, entry: &ImageEntry, pins: &[String], actions: &mut UiActions) {
+/// (ordinal-colored, copy button + click to copy) with its location underneath.
+fn pinned_list_ui(
+    ui: &mut Ui,
+    entry: &ImageEntry,
+    pins: &[Pin],
+    use_titles: bool,
+    actions: &mut UiActions,
+) {
     if pins.is_empty() {
         _ = ui.label(RichText::new("Nothing pinned. Pin keys from the tree view.").weak());
         return;
@@ -874,31 +1365,48 @@ fn pinned_list_ui(ui: &mut Ui, entry: &ImageEntry, pins: &[String], actions: &mu
     for pin in pins {
         _ = ui.horizontal(|ui| {
             _ = ui.label(RichText::new(pin_label(pin)).strong());
-            if pin.contains('.') {
-                _ = ui.label(RichText::new("exact path").small().weak())
-                    .on_hover_text(pin.clone());
+            let tag = match pin.mode {
+                PinMode::Title => Some("node title"),
+                _ if pin.pattern.contains('.') => Some("exact path"),
+                _ => None,
+            };
+            if let Some(tag) = tag {
+                _ = ui.label(RichText::new(tag).small().weak())
+                    .on_hover_text(pin.pattern.clone());
             }
         });
-        let matches = entry.rows_for_pin(pin);
+        let matches = entry.rows_for_pin(&pin.pattern, pin.mode, use_titles);
         if matches.is_empty() {
-            _ = ui.indent((pin.as_str(), 0usize), |ui| {
+            _ = ui.indent((pin.pattern.as_str(), 0usize), |ui| {
                 _ = ui.label(RichText::new("—").weak());
             });
         }
         for (i, row) in matches.iter().enumerate() {
-            _ = ui.indent((pin.as_str(), i), |ui| {
-                let color = ordinal_color(ui, i);
-                let response = ui
-                    .add(
-                        Label::new(
-                            RichText::new(single_line(&row.value, 300)).monospace().color(color),
+            _ = ui.indent((pin.pattern.as_str(), i), |ui| {
+                _ = ui.horizontal_top(|ui| {
+                    if ui
+                        .add(Button::new("📋").small().frame(false))
+                        .on_hover_text("Copy full value")
+                        .clicked()
+                    {
+                        actions.copy = Some((pin_label(pin), row.value.clone()));
+                    }
+                    let color = ordinal_color(ui, i);
+                    let response = ui
+                        .add(
+                            Label::new(
+                                RichText::new(single_line(&row.value, 300))
+                                    .monospace()
+                                    .color(color),
+                            )
+                            .wrap()
+                            .sense(Sense::click()),
                         )
-                        .sense(Sense::click()),
-                    )
-                    .on_hover_text("Click to copy full value");
-                if response.clicked() {
-                    actions.copy = Some((row.key.clone(), row.value.clone()));
-                }
+                        .on_hover_text("Click to copy full value");
+                    if response.clicked() {
+                        actions.copy = Some((pin_label(pin), row.value.clone()));
+                    }
+                });
                 _ = ui.label(RichText::new(&row.path).small().weak());
             });
         }
@@ -906,169 +1414,388 @@ fn pinned_list_ui(ui: &mut Ui, entry: &ImageEntry, pins: &[String], actions: &mu
     }
 }
 
-fn chunk_tree_ui(
-    ui: &mut Ui,
-    entry: &ImageEntry,
-    pins: &[String],
+/// Read-only inputs threaded through the metadata tree renderer.
+#[derive(Clone, Copy)]
+struct TreeCtx<'a> {
+    entry: &'a ImageEntry,
+    pins: &'a [Pin],
+    /// One-frame override forcing every section open or closed.
     force_open: Option<bool>,
-    actions: &mut UiActions,
-) {
-    _ = egui::CollapsingHeader::new(RichText::new("file").strong())
-        .id_salt("file-metadata")
-        .default_open(true)
-        .open(force_open)
-        .show(ui, |ui| {
-            for row in entry.file_rows() {
-                leaf_row_ui(ui, &row.path, &row.key, &row.value, pins, actions);
-            }
-        });
-    if entry.chunks.is_empty() {
+    /// Lowercased search query. Empty renders the full tree; non-empty prunes
+    /// branches with no match and defaults the surviving branches open.
+    query: &'a str,
+    /// ComfyUI-titles setting: gates title-pin creation and pin indicators.
+    use_titles: bool,
+    /// One-frame find target (a row or node path): every header on the path
+    /// to it or under it is forced open, and the target scrolls into view.
+    jump: Option<&'a str>,
+}
+
+/// True when `header_path` is the jump target itself, an ancestor of it (the
+/// header must open to reveal the target), or a descendant (the target is a
+/// node whose whole subtree should open).
+fn jump_opens(header_path: &str, target: &str) -> bool {
+    if header_path == target {
+        return true;
+    }
+    let is_ancestor = target.len() > header_path.len()
+        && target.starts_with(header_path)
+        && target.as_bytes()[header_path.len()] == b'.';
+    let is_descendant = header_path.len() > target.len()
+        && header_path.starts_with(target)
+        && header_path.as_bytes()[target.len()] == b'.';
+    is_ancestor || is_descendant
+}
+
+/// The `.open(..)` override for a header at `path`: a jump hit forces open,
+/// otherwise the expand/collapse-all override applies.
+fn header_open_override(ctx: &TreeCtx<'_>, path: &str) -> Option<bool> {
+    match ctx.jump {
+        Some(target) if jump_opens(path, target) => Some(true),
+        _ => ctx.force_open,
+    }
+}
+
+/// True when any flattened row belonging to `chunk` matches the query.
+fn chunk_matches(entry: &ImageEntry, chunk: &ParsedChunk, query: &str) -> bool {
+    match &chunk.payload {
+        ChunkPayload::Json(value) => {
+            index::subtree_matches(&chunk.keyword, &chunk.keyword, value, query)
+        }
+        ChunkPayload::Plain(_) => {
+            let keyword_lc = chunk.keyword.to_lowercase();
+            let prefix = format!("{keyword_lc}.");
+            entry
+                .rows
+                .iter()
+                .filter(|row| row.path_lc == keyword_lc || row.path_lc.starts_with(&prefix))
+                .any(|row| index::row_matches(row, query))
+        }
+    }
+}
+
+fn chunk_tree_ui(ui: &mut Ui, ctx: &TreeCtx<'_>, actions: &mut UiActions) {
+    let searching = !ctx.query.is_empty();
+    let mut shown_any = false;
+
+    let file_rows: Vec<_> = ctx
+        .entry
+        .file_rows()
+        .filter(|row| !searching || index::row_matches(row, ctx.query))
+        .collect();
+    if !file_rows.is_empty() {
+        shown_any = true;
+        _ = egui::CollapsingHeader::new(RichText::new("file").strong())
+            .id_salt(("file-metadata", ctx.query))
+            .default_open(true)
+            .open(header_open_override(ctx, "file"))
+            .show(ui, |ui| {
+                for row in file_rows {
+                    leaf_row_ui(ui, ctx, &row.path, &row.key, &row.value, true, actions);
+                }
+            });
+    }
+
+    if ctx.entry.chunks.is_empty() && !searching {
         _ = ui.label(RichText::new("No text chunks in this image").weak());
         return;
     }
-    for chunk in &entry.chunks {
+
+    for (chunk_index, chunk) in ctx.entry.chunks.iter().enumerate() {
+        // A query hit on the chunk keyword shows the whole chunk unfiltered;
+        // otherwise prune to matching subtrees and skip chunks with no match.
+        let mut chunk_query = ctx.query;
+        if searching {
+            if chunk.keyword.to_lowercase().contains(ctx.query) {
+                chunk_query = "";
+            } else if !chunk_matches(ctx.entry, chunk, ctx.query) {
+                continue;
+            }
+        }
+        shown_any = true;
+        let chunk_ctx = TreeCtx {
+            query: chunk_query,
+            ..*ctx
+        };
         let title = format!("{}  ({})", chunk.keyword, human_size(chunk.byte_len as u64));
-        _ = egui::CollapsingHeader::new(RichText::new(title).strong())
-            .id_salt(("chunk", &chunk.keyword))
+        let header = egui::CollapsingHeader::new(RichText::new(title).strong())
+            .id_salt(("chunk", chunk_index, &chunk.keyword, chunk_ctx.query))
             .default_open(true)
-            .open(force_open)
+            .open(header_open_override(ctx, &chunk.keyword))
             .show(ui, |ui| match &chunk.payload {
                 ChunkPayload::Json(value) => {
-                    json_tree_ui(
-                        ui,
-                        &chunk.keyword,
-                        &chunk.keyword,
-                        value,
-                        1,
-                        pins,
-                        force_open,
-                        actions,
-                    );
+                    json_tree_ui(ui, &chunk_ctx, &chunk.keyword, &chunk.keyword, value, 1, actions);
                 }
                 ChunkPayload::Plain(text) => {
                     value_label_ui(ui, &chunk.keyword, text, actions);
                 }
             });
+        // A plain chunk renders one text blob, so any jump inside it lands on
+        // the chunk header; a JSON chunk scrolls at the inner row instead.
+        let scroll_here = match (&chunk.payload, ctx.jump) {
+            (_, Some(target)) if target == chunk.keyword => true,
+            (ChunkPayload::Plain(_), Some(target)) => {
+                jump_opens(&chunk.keyword, target)
+            }
+            _ => false,
+        };
+        if scroll_here {
+            header.header_response.scroll_to_me(Some(Align::Center));
+        }
+    }
+
+    if searching && !shown_any {
+        _ = ui.label(RichText::new("No matches in this image").weak());
     }
 }
 
 #[allow(clippy::too_many_arguments)]
 fn json_tree_ui(
     ui: &mut Ui,
+    ctx: &TreeCtx<'_>,
     path: &str,
     key: &str,
     value: &Value,
     depth: usize,
-    pins: &[String],
-    force_open: Option<bool>,
     actions: &mut UiActions,
 ) {
+    let searching = !ctx.query.is_empty();
     match value {
         Value::Object(map) => {
+            let children: Vec<(&String, &Value)> = map
+                .iter()
+                .filter(|(child_key, child)| {
+                    !searching
+                        || index::subtree_matches(
+                            &format!("{path}.{child_key}"),
+                            child_key,
+                            child,
+                            ctx.query,
+                        )
+                })
+                .collect();
             // The chunk's own collapsing header already wraps the root object,
             // so only nested objects get their own header.
             if depth == 1 {
-                for (child_key, child) in map {
+                for (child_key, child) in children {
                     let child_path = format!("{path}.{child_key}");
-                    json_tree_ui(ui, &child_path, child_key, child, depth + 1, pins, force_open, actions);
+                    json_tree_ui(ui, ctx, &child_path, child_key, child, depth + 1, actions);
                 }
             } else {
-                let header = format!("{key}  {{{}}}", map.len());
-                _ = egui::CollapsingHeader::new(header)
-                    .id_salt(path)
-                    .default_open(false)
-                    .open(force_open)
+                let header = format!("{key}  {{{}}}", children.len());
+                let response = egui::CollapsingHeader::new(header)
+                    .id_salt((path, ctx.query))
+                    .default_open(searching)
+                    .open(header_open_override(ctx, path))
                     .show(ui, |ui| {
-                        for (child_key, child) in map {
+                        for (child_key, child) in children {
                             let child_path = format!("{path}.{child_key}");
-                            json_tree_ui(ui, &child_path, child_key, child, depth + 1, pins, force_open, actions);
+                            json_tree_ui(ui, ctx, &child_path, child_key, child, depth + 1, actions);
                         }
                     });
+                if ctx.jump == Some(path) {
+                    response.header_response.scroll_to_me(Some(Align::Center));
+                }
             }
         }
         Value::Array(items) => {
-            let header = format!("{key}  [{}]", items.len());
-            _ = egui::CollapsingHeader::new(header)
-                .id_salt(path)
-                .default_open(false)
-                .open(force_open)
+            let children: Vec<(usize, &Value)> = items
+                .iter()
+                .enumerate()
+                .filter(|(i, child)| {
+                    !searching
+                        || index::subtree_matches(&format!("{path}.{i}"), key, child, ctx.query)
+                })
+                .collect();
+            let header = format!("{key}  [{}]", children.len());
+            let response = egui::CollapsingHeader::new(header)
+                .id_salt((path, ctx.query))
+                .default_open(searching)
+                .open(header_open_override(ctx, path))
                 .show(ui, |ui| {
-                    for (i, child) in items.iter().enumerate() {
+                    for (i, child) in children {
                         let child_path = format!("{path}.{i}");
                         let child_key = format!("{key}[{i}]");
-                        json_tree_ui(ui, &child_path, &child_key, child, depth + 1, pins, force_open, actions);
+                        // Array elements are non-direct: their display key is
+                        // synthetic, so key pins must not be offered on them.
+                        json_tree_ui(ui, ctx, &child_path, &child_key, child, depth + 1, actions);
                     }
                 });
+            if ctx.jump == Some(path) {
+                response.header_response.scroll_to_me(Some(Align::Center));
+            }
         }
         leaf => {
             let text = match leaf {
                 Value::String(s) => s.clone(),
                 other => other.to_string(),
             };
-            leaf_row_ui(ui, path, key, &text, pins, actions);
+            // A synthetic `key[i]` display key marks an array element; those
+            // rows are non-direct and never satisfy bare key pins.
+            let direct = !key.ends_with(']');
+            leaf_row_ui(ui, ctx, path, key, &text, direct, actions);
         }
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn leaf_row_ui(
     ui: &mut Ui,
+    ctx: &TreeCtx<'_>,
     path: &str,
     key: &str,
     value: &str,
-    pins: &[String],
+    direct: bool,
     actions: &mut UiActions,
 ) {
-    _ = ui.horizontal(|ui| {
-        let key_pinned = pins.iter().any(|p| p.eq_ignore_ascii_case(key));
-        let path_pinned = pins.iter().any(|p| p.eq_ignore_ascii_case(path));
-        let pinned = key_pinned || path_pinned;
+    let row = ui.horizontal(|ui| {
+        // Map-backed lowercase title: cheap enough for the per-frame pinned
+        // indicator. The original-case title (a row walk) is fetched only on
+        // click or when the context menu is open.
+        let title_lc = if ctx.use_titles && direct {
+            ctx.entry.node_title_lc(path)
+        } else {
+            None
+        };
+        let key_pinned = direct
+            && ctx.pins.iter().any(|p| {
+                matches!(p.mode, PinMode::Key | PinMode::Auto)
+                    && p.pattern.eq_ignore_ascii_case(key)
+            });
+        let path_pinned = ctx.pins.iter().any(|p| p.pattern.eq_ignore_ascii_case(path));
+        let title_pinned = title_lc.is_some_and(|title| {
+            ctx.pins.iter().any(|p| {
+                let title_matchable = match p.mode {
+                    PinMode::Title => true,
+                    PinMode::Auto => !p.pattern.contains('.'),
+                    PinMode::Key => false,
+                };
+                title_matchable
+                    && !p.pattern.is_empty()
+                    && title.contains(&p.pattern.to_lowercase())
+            })
+        });
+        let pinned = key_pinned || path_pinned || title_pinned;
         let pin_text = if pinned {
             RichText::new("📌")
         } else {
             RichText::new("📌").weak()
         };
+        let hover = if title_lc.is_some() {
+            "Left-click: pin/unpin by node title (survives workflow changes)\nRight-click: pin options"
+        } else if direct {
+            "Left-click: pin/unpin key (all locations)\nRight-click: pin options"
+        } else {
+            "Left-click: pin/unpin this exact location\nRight-click: pin options"
+        };
         let pin_button = ui
             .add(Button::new(pin_text).small().frame(false))
-            .on_hover_text("Left-click: pin/unpin key (all locations)\nRight-click: pin options");
+            .on_hover_text(hover);
         if pin_button.clicked() {
-            let target = if path_pinned { path } else { key };
-            actions.toggle_pin = Some(target.to_string());
+            let node_title = if ctx.use_titles {
+                ctx.entry.node_title_for(path)
+            } else {
+                None
+            };
+            let target = match (path_pinned, direct, node_title) {
+                // Toggling removes the existing exact-path pin.
+                (true, _, _) => Pin {
+                    pattern: path.to_string(),
+                    label: None,
+                    mode: PinMode::Key,
+                },
+                // A title pin only ever resolves `inputs.*` rows, so create one
+                // only where the indicator and hover text say so (`title_lc`);
+                // any other direct leaf gets the key pin its hover advertises.
+                (false, true, Some(title)) if title_lc.is_some() => Pin::title(title),
+                (false, true, _) => Pin::key(key),
+                (false, false, maybe_title) => Pin {
+                    pattern: path.to_string(),
+                    label: maybe_title,
+                    mode: PinMode::Key,
+                },
+            };
+            actions.toggle_pin = Some(target);
         }
         _ = pin_button.context_menu(|ui| {
-            let key_text = if key_pinned {
-                format!("Unpin key '{key}'")
-            } else {
-                format!("Pin key '{key}'  (all locations)")
-            };
-            if ui.button(key_text).clicked() {
-                actions.toggle_pin = Some(key.to_string());
-                ui.close();
+            if direct {
+                let key_text = if key_pinned {
+                    format!("Unpin key '{key}'")
+                } else {
+                    format!("Pin key '{key}'  (all locations)")
+                };
+                if ui.button(key_text).clicked() {
+                    actions.toggle_pin = Some(Pin::key(key));
+                    ui.close();
+                }
+            }
+            let node_title = ctx.entry.node_title_for(path);
+            // Same `title_lc` gate as the click: offer a title pin only where a
+            // title pin can actually match. The exact-path label below keeps
+            // using the unrestricted title.
+            if title_lc.is_some()
+                && let Some(title) = &node_title
+            {
+                let title_text = if title_pinned {
+                    format!("Unpin node title '{title}'")
+                } else {
+                    format!("Pin node title '{title}'  (all workflows)")
+                };
+                if ui.button(title_text).clicked() {
+                    actions.toggle_pin = Some(Pin::title(title.clone()));
+                    ui.close();
+                }
             }
             let path_text = if path_pinned {
-                "Unpin this exact path".to_string()
+                "Unpin this exact path"
             } else {
-                "Pin exact path  (this location only)".to_string()
+                "Pin exact path  (this location only)"
             };
             if ui.button(path_text).clicked() {
-                actions.toggle_pin = Some(path.to_string());
+                actions.toggle_pin = Some(Pin {
+                    pattern: path.to_string(),
+                    label: if path_pinned { None } else { node_title },
+                    mode: PinMode::Key,
+                });
                 ui.close();
             }
         });
         _ = ui.label(RichText::new(key).strong());
+        if ui
+            .add(Button::new("📋").small().frame(false))
+            .on_hover_text("Copy full value")
+            .clicked()
+        {
+            actions.copy = Some((key.to_string(), value.to_string()));
+        }
         let response = ui
             .add(
                 Label::new(RichText::new(single_line(value, 120)).monospace())
                     .truncate()
                     .sense(Sense::click()),
             )
-            .on_hover_text(format!("{path}\n\n{value}\n\n(click to copy)"));
+            .on_hover_text(format!(
+                "{path}\n\n{}\n\n(click to copy)",
+                tooltip_excerpt(value)
+            ));
         if response.clicked() {
             actions.copy = Some((key.to_string(), value.to_string()));
         }
     });
+    if ctx.jump == Some(path) {
+        row.response.scroll_to_me(Some(Align::Center));
+    }
 }
 
+/// Plain-text chunk body: an explicit copy button above the (clickable) text.
 fn value_label_ui(ui: &mut Ui, key: &str, value: &str, actions: &mut UiActions) {
+    if ui
+        .add(Button::new("📋 Copy").small())
+        .on_hover_text("Copy full text")
+        .clicked()
+    {
+        actions.copy = Some((key.to_string(), value.to_string()));
+    }
     let response = ui
         .add(
             Label::new(RichText::new(single_line(value, 300)).monospace())
@@ -1077,5 +1804,69 @@ fn value_label_ui(ui: &mut Ui, key: &str, value: &str, actions: &mut UiActions) 
         .on_hover_text("Click to copy full value");
     if response.clicked() {
         actions.copy = Some((key.to_string(), value.to_string()));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `count` cached thumbnails, inserted oldest (`img0`) to newest.
+    fn cache(count: usize) -> (VecDeque<PathBuf>, HashMap<PathBuf, ()>) {
+        let mut order = VecDeque::new();
+        let mut live = HashMap::new();
+        for i in 0..count {
+            let path = PathBuf::from(format!("img{i}.png"));
+            _ = live.insert(path.clone(), ());
+            order.push_back(path);
+        }
+        (order, live)
+    }
+
+    #[test]
+    fn eviction_drops_the_least_recently_drawn_entry() {
+        let (mut order, mut live) = cache(4);
+        evict_stale_textures(&mut order, &mut live, 3);
+        assert_eq!(order.len(), 3);
+        assert_eq!(live.len(), 3);
+        assert!(!live.contains_key(Path::new("img0.png")));
+    }
+
+    #[test]
+    fn drawing_an_old_thumbnail_protects_it_from_eviction() {
+        // `img0` is the oldest insertion, so age-ordered eviction would drop
+        // exactly the thumbnail that is on screen. Drawing it must not.
+        let (mut order, mut live) = cache(4);
+        let drawn = [PathBuf::from("img0.png"), PathBuf::from("img0.png")];
+        touch_texture_order(&mut order, &live, &drawn);
+        // Repeats collapse: one entry per path, so the cap still counts textures.
+        assert_eq!(order.len(), 4);
+        assert_eq!(order.back().map(PathBuf::as_path), Some(Path::new("img0.png")));
+        evict_stale_textures(&mut order, &mut live, 3);
+        assert!(live.contains_key(Path::new("img0.png")));
+        assert!(!live.contains_key(Path::new("img1.png")));
+    }
+
+    #[test]
+    fn drawn_order_becomes_the_new_tail_order() {
+        let (mut order, live) = cache(3);
+        let drawn = [PathBuf::from("img2.png"), PathBuf::from("img0.png")];
+        touch_texture_order(&mut order, &live, &drawn);
+        let tail: Vec<&Path> = order.iter().map(PathBuf::as_path).collect();
+        assert_eq!(
+            tail,
+            vec![
+                Path::new("img1.png"),
+                Path::new("img2.png"),
+                Path::new("img0.png"),
+            ]
+        );
+    }
+
+    #[test]
+    fn touching_a_path_with_no_texture_does_not_grow_the_order() {
+        let (mut order, live) = cache(2);
+        touch_texture_order(&mut order, &live, &[PathBuf::from("gone.png")]);
+        assert_eq!(order.len(), 2);
     }
 }

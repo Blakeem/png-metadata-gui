@@ -1,6 +1,7 @@
 //! Background thumbnail decoding: worker threads decode PNGs at reduced size
 //! and hand RGBA buffers back to the UI thread for texture upload.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex};
@@ -15,7 +16,10 @@ type ThumbResult = (PathBuf, Option<egui::ColorImage>);
 pub struct ThumbPool {
     request_tx: Sender<PathBuf>,
     result_rx: Receiver<ThumbResult>,
-    pending: usize,
+    /// Paths queued but not yet returned. Doubles as request de-duplication
+    /// (the UI re-requests evicted thumbnails every frame) and as the pending
+    /// count, so the two can never drift apart.
+    in_flight: HashSet<PathBuf>,
 }
 
 impl ThumbPool {
@@ -35,7 +39,12 @@ impl ThumbPool {
                         guard.recv()
                     };
                     let Ok(path) = request else { return };
-                    let image = decode_thumbnail(&path);
+                    // A panic inside the decoder would kill this worker and
+                    // starve the request of its result; catch it so every
+                    // request still produces exactly one result.
+                    let image = std::panic::catch_unwind(|| decode_thumbnail(&path))
+                        .ok()
+                        .flatten();
                     if worker_tx.send((path, image)).is_err() {
                         return;
                     }
@@ -47,24 +56,31 @@ impl ThumbPool {
         Self {
             request_tx,
             result_rx,
-            pending: 0,
+            in_flight: HashSet::new(),
         }
     }
 
+    /// Queue a decode. A path already in flight is a no-op, so the UI may
+    /// re-request a missing thumbnail every frame without piling up work.
     pub fn request(&mut self, path: PathBuf) {
-        if self.request_tx.send(path).is_ok() {
-            self.pending += 1;
+        if self.in_flight.contains(&path) {
+            return;
+        }
+        if self.request_tx.send(path.clone()).is_ok() {
+            _ = self.in_flight.insert(path);
         }
     }
 
     pub fn poll(&mut self) -> Vec<ThumbResult> {
         let results: Vec<ThumbResult> = self.result_rx.try_iter().collect();
-        self.pending = self.pending.saturating_sub(results.len());
+        for (path, _) in &results {
+            _ = self.in_flight.remove(path);
+        }
         results
     }
 
     pub fn pending(&self) -> usize {
-        self.pending
+        self.in_flight.len()
     }
 }
 

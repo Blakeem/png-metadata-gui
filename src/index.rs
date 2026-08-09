@@ -19,6 +19,7 @@ pub struct MetaRow {
     pub key: String,
     pub value: String,
     pub path_lc: String,
+    pub key_lc: String,
     pub value_lc: String,
     /// True when the leaf sits directly under its own named key. False for
     /// array elements (e.g. ComfyUI node links like `["123", 0]`), which
@@ -34,12 +35,14 @@ pub struct MetaRow {
 impl MetaRow {
     pub fn new(path: String, key: String, value: String, is_direct: bool) -> Self {
         let path_lc = path.to_lowercase();
+        let key_lc = key.to_lowercase();
         let value_lc = value.to_lowercase();
         Self {
             path,
             key,
             value,
             path_lc,
+            key_lc,
             value_lc,
             is_direct,
             sort_key: None,
@@ -50,6 +53,43 @@ impl MetaRow {
         self.sort_key = Some(sort_key);
         self
     }
+}
+
+/// Search predicate, shared by the image filter and the tree view. A query
+/// containing `.` matches against the full dotted path; a bare query matches
+/// against the key or the value. Matching the path with bare queries is
+/// deliberately avoided: the chunk keyword (`prompt`) prefixes every path, so
+/// path matching would make such queries match every row in the chunk.
+/// `query` must already be lowercased.
+pub fn row_matches(row: &MetaRow, query: &str) -> bool {
+    if query.contains('.') {
+        return row.path_lc.contains(query);
+    }
+    row.key_lc.contains(query) || row.value_lc.contains(query)
+}
+
+/// True when any leaf inside `value` would satisfy [`row_matches`]. Used by
+/// the tree view to prune branches with no match while a search is active.
+/// `path` and `nearest_key` mirror the naming used by [`flatten`].
+pub fn subtree_matches(path: &str, nearest_key: &str, value: &Value, query: &str) -> bool {
+    match value {
+        Value::Object(map) => map.iter().any(|(child_key, child)| {
+            subtree_matches(&format!("{path}.{child_key}"), child_key, child, query)
+        }),
+        Value::Array(items) => items.iter().enumerate().any(|(i, child)| {
+            subtree_matches(&format!("{path}.{i}"), nearest_key, child, query)
+        }),
+        Value::String(s) => leaf_matches(path, nearest_key, s, query),
+        other => leaf_matches(path, nearest_key, &other.to_string(), query),
+    }
+}
+
+/// Leaf-level form of [`row_matches`] for values that are not flattened yet.
+fn leaf_matches(path: &str, key: &str, value: &str, query: &str) -> bool {
+    if query.contains('.') {
+        return path.to_lowercase().contains(query);
+    }
+    key.to_lowercase().contains(query) || value.to_lowercase().contains(query)
 }
 
 pub fn parse_payload(text: &str) -> ChunkPayload {
@@ -72,7 +112,10 @@ fn parse_json_lenient(text: &str) -> Option<Value> {
 /// skipping string literals. Returns `None` when nothing was replaced.
 fn replace_nonfinite_tokens(text: &str) -> Option<String> {
     let bytes = text.as_bytes();
-    let mut out = String::with_capacity(text.len());
+    // Bytes, not chars: `u8 as char` would re-encode every multi-byte UTF-8
+    // sequence as Latin-1 mojibake. Everything inserted here is ASCII, so the
+    // original UTF-8 survives byte-for-byte.
+    let mut out: Vec<u8> = Vec::with_capacity(text.len());
     let mut replaced = false;
     let mut in_string = false;
     let mut escaped = false;
@@ -89,13 +132,13 @@ fn replace_nonfinite_tokens(text: &str) -> Option<String> {
             } else if b == b'"' {
                 in_string = false;
             }
-            out.push(b as char);
+            out.push(b);
             i += 1;
             continue;
         }
         if b == b'"' {
             in_string = true;
-            out.push('"');
+            out.push(b'"');
             prev_significant = b'"';
             i += 1;
             continue;
@@ -115,7 +158,7 @@ fn replace_nonfinite_tokens(text: &str) -> Option<String> {
                 None
             };
             if let Some(len) = token_len {
-                out.push_str("null");
+                out.extend_from_slice(b"null");
                 replaced = true;
                 i += len;
                 prev_significant = b'l';
@@ -125,11 +168,11 @@ fn replace_nonfinite_tokens(text: &str) -> Option<String> {
         if !b.is_ascii_whitespace() {
             prev_significant = b;
         }
-        out.push(b as char);
+        out.push(b);
         i += 1;
     }
 
-    replaced.then_some(out)
+    replaced.then(|| String::from_utf8(out).ok()).flatten()
 }
 
 pub fn flatten(keyword: &str, payload: &ChunkPayload) -> Vec<MetaRow> {
@@ -181,6 +224,7 @@ fn walk_json(
 
 fn flatten_plain(keyword: &str, text: &str, rows: &mut Vec<MetaRow>) {
     let mut found_pairs = false;
+    let mut saw_non_pair = false;
     for token in text.split_whitespace() {
         if let Some((key, value)) = token.split_once('=')
             && !key.is_empty()
@@ -192,9 +236,14 @@ fn flatten_plain(keyword: &str, text: &str, rows: &mut Vec<MetaRow>) {
                 true,
             ));
             found_pairs = true;
+        } else {
+            saw_non_pair = true;
         }
     }
-    if !found_pairs {
+    // Pure `key=value` chunks keep only their pair rows; anything with free
+    // text also gets the whole text as one row, so no word is missing from
+    // search or the tree.
+    if !found_pairs || saw_non_pair {
         rows.push(MetaRow::new(
             keyword.to_string(),
             keyword.to_string(),
@@ -251,10 +300,62 @@ mod tests {
     }
 
     #[test]
+    fn nan_sanitizer_preserves_non_ascii_text() {
+        let payload = parse_payload(r#"{"a": NaN, "p": "café 日本 — ✓"}"#);
+        let rows = flatten("prompt", &payload);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].value, "null");
+        assert_eq!(rows[1].value, "café 日本 — ✓");
+    }
+
+    #[test]
+    fn bare_query_matches_key_or_value_but_not_path_prefix() {
+        let payload = parse_payload(
+            r#"{"6": {"inputs": {"value": "a cat"}, "_meta": {"title": "Positive Prompt"}}}"#,
+        );
+        let rows = flatten("prompt", &payload);
+        // "prompt" prefixes every path, but only the title *value* contains it.
+        let hits: Vec<&MetaRow> = rows.iter().filter(|r| row_matches(r, "prompt")).collect();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].path, "prompt.6._meta.title");
+        // Bare queries match keys; dotted queries match paths.
+        assert!(rows.iter().any(|r| row_matches(r, "value")));
+        assert!(rows.iter().any(|r| row_matches(r, "prompt.6.inputs.value")));
+        assert!(!rows.iter().any(|r| row_matches(r, "prompt.7")));
+    }
+
+    #[test]
+    fn subtree_matches_prunes_non_matching_branches() {
+        let payload = parse_payload(
+            r#"{"6": {"inputs": {"value": "a cat"}}, "7": {"inputs": {"seed": 42}}}"#,
+        );
+        let ChunkPayload::Json(root) = &payload else {
+            panic!("expected JSON payload");
+        };
+        assert!(subtree_matches("prompt.6", "6", &root["6"], "cat"));
+        assert!(!subtree_matches("prompt.7", "7", &root["7"], "cat"));
+        assert!(subtree_matches("prompt.7", "7", &root["7"], "seed"));
+        assert!(subtree_matches("prompt.7", "7", &root["7"], "prompt.7.inputs.seed"));
+    }
+
+    #[test]
     fn free_text_becomes_single_row() {
         let payload = parse_payload("a photo of a cat, masterpiece");
         let rows = flatten("parameters", &payload);
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].key, "parameters");
+    }
+
+    #[test]
+    fn mixed_text_keeps_pairs_and_full_text() {
+        let payload = parse_payload("a prompt with <lora:x=y> inside");
+        let rows = flatten("parameters", &payload);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].path, "parameters.<lora:x");
+        assert_eq!(rows[0].value, "y>");
+        assert_eq!(rows[1].path, "parameters");
+        // The free-text words stay searchable instead of being dropped.
+        assert!(rows.iter().any(|row| row_matches(row, "prompt")));
+        assert!(rows.iter().any(|row| row_matches(row, "inside")));
     }
 }

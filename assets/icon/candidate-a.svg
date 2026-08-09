@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256">
+  <!-- A: photo card behind, magnifier lens reveals text lines (metadata) -->
+  <defs>
+    <clipPath id="card"><rect x="34" y="46" width="126" height="126" rx="14"/></clipPath>
+  </defs>
+  <rect x="8" y="8" width="240" height="240" rx="52" fill="#142433"/>
+  <g clip-path="url(#card)">
+    <rect x="34" y="46" width="126" height="126" fill="#f1f5f9"/>
+    <circle cx="72" cy="84" r="14" fill="#f59e0b"/>
+    <path d="M20 172 L84 102 L114 134 L132 116 L174 160 L174 184 L20 184 Z" fill="#3b82f6"/>
+  </g>
+  <circle cx="158" cy="142" r="60" fill="#0f172a"/>
+  <rect x="126" y="116" width="64" height="13" rx="6.5" fill="#e2e8f0"/>
+  <rect x="126" y="138" width="46" height="13" rx="6.5" fill="#f59e0b"/>
+  <rect x="126" y="160" width="58" height="13" rx="6.5" fill="#e2e8f0"/>
+  <circle cx="158" cy="142" r="60" fill="none" stroke="#e2e8f0" stroke-width="13"/>
+  <line x1="201" y1="185" x2="230" y2="214" stroke="#e2e8f0" stroke-width="23" stroke-linecap="round"/>
+</svg>

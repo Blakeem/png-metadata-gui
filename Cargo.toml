@@ -1,6 +1,6 @@
 [package]
 name = "png-metadata-gui"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 description = "Fast cross-platform GUI for browsing PNG text-chunk metadata from ComfyUI and Stable Diffusion images"
 license = "MIT"
@@ -8,6 +8,8 @@ repository = "https://github.com/Blakeem/png-metadata-gui"
 readme = "README.md"
 keywords = ["png", "metadata", "comfyui", "stable-diffusion", "egui"]
 categories = ["multimedia::images", "gui"]
+# tools/ holds the standalone icon-forge dev crate — not part of this package.
+exclude = ["tools/"]
 
 [dependencies]
 chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
@@ -16,7 +18,12 @@ egui_extras = "0.36.1"
 flate2 = "1.1.9"
 image = { version = "0.25.10", default-features = false, features = ["png"] }
 rfd = "0.17.2"
+serde = { version = "1.0", features = ["derive"] }
 serde_json = { version = "1.0.151", features = ["preserve_order"] }
+
+# Embeds assets/icon.ico into the Windows exe (no-op for other targets).
+[build-dependencies]
+winresource = "0.1"
 
 # Optimize dependencies even in dev builds: PNG decoding is far too slow at opt-level 0.
 [profile.dev.package."*"]

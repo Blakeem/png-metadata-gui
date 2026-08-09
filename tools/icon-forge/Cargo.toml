@@ -1,0 +1,10 @@
+[package]
+name = "icon-forge"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+resvg = "0.44"
+
+[profile.dev]
+opt-level = 2

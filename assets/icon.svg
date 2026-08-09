@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256">
+  <!-- B: a PNG file sits inside the lens — "inspecting the png" -->
+  <rect x="8" y="8" width="240" height="240" rx="52" fill="#10243a"/>
+  <circle cx="118" cy="118" r="84" fill="#f8fafc"/>
+  <path d="M82 64 L134 64 L162 92 L162 168 A12 12 0 0 1 150 180 L94 180 A12 12 0 0 1 82 168 Z" fill="#334155"/>
+  <path d="M134 64 L134 92 L162 92 Z" fill="#94a3b8"/>
+  <circle cx="104" cy="102" r="8" fill="#f59e0b"/>
+  <path d="M90 134 L110 112 L124 126 L132 118 L154 140 L154 144 L90 144 Z" fill="#38bdf8"/>
+  <rect x="94" y="152" width="54" height="8" rx="4" fill="#cbd5e1"/>
+  <rect x="94" y="165" width="40" height="8" rx="4" fill="#cbd5e1"/>
+  <circle cx="118" cy="118" r="84" fill="none" stroke="#38bdf8" stroke-width="15"/>
+  <line x1="180" y1="180" x2="222" y2="222" stroke="#38bdf8" stroke-width="26" stroke-linecap="round"/>
+</svg>

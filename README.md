@@ -18,19 +18,31 @@ binary, instant startup, no browser engine.
 ## Features
 
 - Folder table with thumbnails and a sortable column per pinned field
-- Pin a key (`cfg`, matches every location) or an exact path
-  (`prompt.183.inputs.cfg`) by right-clicking any 📌 in the tree
+- Pin a key (`cfg`, matches every location), an exact path
+  (`prompt.183.inputs.cfg`), or — for ComfyUI images — a **node title**
+  ("Positive Prompt"), which follows the node's `_meta.title` and keeps
+  working across workflows whose node ids differ
+- Rename any pin chip (right-click → Rename) to control its column header
 - Repeated keys (generation vs upscale `cfg`) show every value, color-coded,
   with full paths in the tooltip
-- Live search over every key, path, and value in every image
-- Collapsible JSON tree with expand/collapse all and click-to-copy values
+- Live search over keys, values, and dotted paths; the metadata tree prunes
+  to matches while staying collapsible
+- Find box that jumps to a field in the tree — matching a node title opens
+  the whole node; Enter cycles through matches
+- Collapsible JSON tree with expand/collapse all, copy buttons, and
+  click-to-copy values
 - File size, dimensions, and created/modified dates are pinnable rows, so
   date columns and size sorting work like any tag
+- Folders scan in the background with progress, and a per-folder metadata
+  cache makes reopening a folder near-instant (files revalidate by size +
+  modified time; only changed files are re-read)
+- Reopens your last folder on launch
 - Drag and drop a folder or PNG onto the window; also works with `Open with`
   or a path argument
-- Reads metadata without decoding pixels, so large folders load instantly
-- Handles ComfyUI `prompt` and `workflow` JSON (including Python-style `NaN`),
-  plain `key=value` chunks, and custom keywords
+- Reads metadata without decoding pixels; thumbnails decode in the
+  background with a bounded texture cache
+- Handles ComfyUI `prompt` and `workflow` JSON (including Python-style `NaN`
+  and non-ASCII text), plain `key=value` chunks, and custom keywords
 
 ## Install
 
@@ -57,7 +69,12 @@ png-metadata-gui --dump image.png    # print flattened rows (debug builds)
 ```
 
 Click a row to select it. Arrow keys navigate. Click any value to copy it.
-Right-click pin chips in the toolbar to reorder or remove them.
+Right-click pin chips in the toolbar to rename, reorder, or remove them.
+The ⚙ button next to the pin box holds settings (ComfyUI title pins).
+
+Settings, pins, and the folder metadata cache live in your per-user app-data
+directory (`%APPDATA%\PNG Metadata GUI` on Windows) — the executable itself
+stays standalone.
 
 ## Development
 

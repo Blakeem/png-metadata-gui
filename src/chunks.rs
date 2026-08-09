@@ -50,7 +50,9 @@ pub fn read_png_header(path: &Path) -> Result<PngHeader, String> {
 
         match &chunk_type {
             b"IHDR" => {
-                if length < 8 {
+                // The PNG spec fixes IHDR at 13 bytes; bound both ends so a
+                // corrupt length field cannot drive a huge allocation.
+                if !(8..=13).contains(&length) {
                     return Err("malformed IHDR".to_string());
                 }
                 let mut data = vec![0u8; length as usize];
@@ -134,9 +136,18 @@ fn parse_text_chunk(chunk_type: &[u8; 4], data: &[u8]) -> Option<TextChunk> {
     }
 }
 
+/// Bounded inflate: zlib reaches ~1000:1, so an uncapped decode of a chunk that
+/// passed the compressed-length guard can still exhaust memory and abort the
+/// process. Decompressed output over `MAX_TEXT_CHUNK_LEN` drops the chunk.
 fn inflate(data: &[u8]) -> Option<Vec<u8>> {
     let mut out = Vec::new();
-    _ = ZlibDecoder::new(data).read_to_end(&mut out).ok()?;
+    _ = ZlibDecoder::new(data)
+        .take(MAX_TEXT_CHUNK_LEN as u64)
+        .read_to_end(&mut out)
+        .ok()?;
+    if out.len() >= MAX_TEXT_CHUNK_LEN as usize {
+        return None;
+    }
     Some(out)
 }
 
