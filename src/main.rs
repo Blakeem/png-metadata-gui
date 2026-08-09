@@ -36,7 +36,7 @@ fn main() -> Result<(), eframe::Error> {
         ..Default::default()
     };
     eframe::run_native(
-        "PNG tEXt Viewer",
+        "PNG Metadata GUI",
         options,
         Box::new(move |cc| Ok(Box::new(app::ViewerApp::new(cc, initial_target)))),
     )

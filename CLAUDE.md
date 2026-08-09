@@ -1,4 +1,4 @@
-# png-text-viewer
+# png-metadata-gui
 
 Fast cross-platform desktop viewer for PNG text chunks (tEXt/zTXt/iTXt), aimed at
 ComfyUI / Stable Diffusion image metadata. Opens a folder into a thumbnail table
@@ -15,7 +15,11 @@ cargo clippy --all-targets              # must be zero errors/warnings before co
 cargo build --release                   # optimized single exe (LTO, stripped)
 
 # Run with a folder or file; also supports drag-and-drop and "Open with"
-./target/release/png-text-viewer.exe "C:\path\to\images"
+./target/release/png-metadata-gui.exe "C:\path\to\images"
+
+# Release: push a tag like v0.1.0 — .github/workflows/release.yml builds
+# Windows/macOS/Linux binaries and attaches them to a GitHub Release.
+# Never commit binaries to the repo.
 
 # Print all flattened path=value rows (debug build only — release detaches from console)
 cargo run -- --dump "C:\path\to\image.png"

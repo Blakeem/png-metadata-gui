@@ -2528,7 +2528,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "png-text-viewer"
+name = "png-metadata-gui"
 version = "0.1.0"
 dependencies = [
  "chrono",
