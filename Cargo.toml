@@ -1,6 +1,6 @@
 [package]
 name = "png-metadata-gui"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 description = "Fast cross-platform GUI for browsing PNG text-chunk metadata from ComfyUI and Stable Diffusion images"
 license = "MIT"

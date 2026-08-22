@@ -27,6 +27,7 @@
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use eframe::egui::{
@@ -37,7 +38,12 @@ use egui_extras::{Column, TableBuilder};
 use serde_json::Value;
 
 use crate::cache;
+use crate::full::{self, FullOutcome, FullPool};
 use crate::index::{self, ChunkPayload};
+use crate::lightbox::{
+    self, Lightbox, LightboxDetail, LightboxId, LightboxNav, LightboxShared, LoadStatus,
+    MAX_LIGHTBOXES, ViewCommand,
+};
 use crate::model::{human_size, ImageEntry, ParsedChunk, PinMode};
 use crate::scan::{ScanEvent, ScanTarget, Scanner};
 use crate::thumbs::ThumbPool;
@@ -59,8 +65,12 @@ const LEGACY_PINS_STORAGE_KEY: &str = "pins_v3";
 const SETTINGS_STORAGE_KEY: &str = "settings_v1";
 const ROW_HEIGHT: f32 = 52.0;
 const THUMB_CELL: f32 = 48.0;
-const FLASH_SECONDS: f32 = 2.5;
+pub const FLASH_SECONDS: f32 = 2.5;
 const MAX_CELL_MATCHES: usize = 3;
+/// Cap on the characters one value label lays out. A pinned card renders every
+/// match, so a large cap here multiplies by the match count. The copy actions
+/// always carry the complete value.
+const MAX_VALUE_CHARS: usize = 2000;
 /// Upper bound on live thumbnail textures. A folder of several thousand PNGs
 /// would otherwise pin gigabytes of GPU memory. Eviction is least-recently-
 /// drawn, so it can only ever take an off-screen texture; evicted rows
@@ -78,6 +88,11 @@ struct Pin {
     /// plain key pins.
     #[serde(default)]
     mode: PinMode,
+    /// Per-pin copy button in table cells. `None` means the user never chose,
+    /// so [`default_copy_enabled`] decides. `serde(default)` lets pins saved
+    /// before the button existed load on that default.
+    #[serde(default)]
+    copy: Option<bool>,
 }
 
 impl Pin {
@@ -86,6 +101,7 @@ impl Pin {
             pattern: pattern.to_string(),
             label: None,
             mode: PinMode::Key,
+            copy: None,
         }
     }
 
@@ -95,6 +111,7 @@ impl Pin {
             pattern: pattern.to_string(),
             label: None,
             mode: PinMode::Auto,
+            copy: None,
         }
     }
 
@@ -103,12 +120,28 @@ impl Pin {
             pattern: title.clone(),
             label: Some(title),
             mode: PinMode::Title,
+            copy: None,
         }
     }
 }
 
 fn default_pins() -> Vec<Pin> {
     DEFAULT_PINS.iter().map(|p| Pin::key(p)).collect()
+}
+
+/// Copy-button default for a pin the user never toggled. Prompts and seeds are
+/// the values people copy out of a workflow. The rule reads the displayed name,
+/// so a renamed or exact-path pin follows what its column shows.
+fn default_copy_enabled(display_label: &str) -> bool {
+    let lowered = display_label.to_lowercase();
+    lowered.contains("prompt") || lowered.contains("seed")
+}
+
+/// Whether this pin's table cells show a copy button. An explicit choice wins
+/// over the default in both directions.
+fn pin_copies(pin: &Pin) -> bool {
+    pin.copy
+        .unwrap_or_else(|| default_copy_enabled(&pin_label(pin)))
 }
 
 /// User-configurable options, persisted via eframe storage. `serde(default)`
@@ -123,6 +156,12 @@ struct Settings {
     /// The folder to reopen at launch when no path was passed on the
     /// command line. Updated on every folder open.
     last_folder: Option<PathBuf>,
+    /// Table column widths by [`NAME_COLUMN_KEY`] or [`pin_column_key`].
+    /// egui_extras keeps its own copy in egui memory, which never reaches disk
+    /// and is discarded whenever the column set changes, so the widths live
+    /// here instead. An unpinned column keeps its entry, so re-pinning it
+    /// restores the width the user chose.
+    column_widths: HashMap<String, f32>,
 }
 
 impl Default for Settings {
@@ -130,6 +169,7 @@ impl Default for Settings {
         Self {
             comfyui_titles: true,
             last_folder: None,
+            column_widths: HashMap::new(),
         }
     }
 }
@@ -173,6 +213,8 @@ struct UiActions {
     start_rename: Option<usize>,
     apply_rename: Option<(usize, String)>,
     cancel_rename: bool,
+    /// (pin index, new copy-button state) from the pin chip's context menu.
+    set_pin_copy: Option<(usize, bool)>,
     copy: Option<(String, String)>, // (label, clipboard content)
     set_tree_expanded: Option<bool>,
     toggle_settings: bool,
@@ -183,6 +225,10 @@ struct UiActions {
     /// Thumbnails a widget actually drew this frame, in draw order. Keeps them
     /// at the back of `texture_order` so the cap never evicts a visible one.
     used_thumbs: Vec<PathBuf>,
+    /// Index into `images` whose lightbox window a click asked to open.
+    open_lightbox: Option<usize>,
+    /// This frame's resizable column widths, keyed for [`Settings`].
+    column_widths: Option<Vec<(String, f32)>>,
 }
 
 pub struct ViewerApp {
@@ -204,6 +250,10 @@ pub struct ViewerApp {
     pinned_only: bool,
     sort: Option<(SortColumn, bool)>,
     visible: Vec<usize>,
+    /// `visible` as paths, rebuilt by [`Self::refresh`]. Every lightbox is
+    /// handed this `Arc`, and a refresh replaces the field rather than editing
+    /// it, so an open window keeps the list it opened on.
+    visible_paths: Arc<[PathBuf]>,
     matches: HashMap<usize, MatchInfo>,
     needs_refresh: bool,
     /// One-frame override forcing every tree section open or closed.
@@ -221,10 +271,20 @@ pub struct ViewerApp {
     failed_thumbs: HashSet<PathBuf>,
     flash: Option<(String, Instant)>,
     pending_copy: Option<String>,
+    /// Full-resolution decoder for lightbox windows. Separate from `thumbs`
+    /// so opening one can never stall the table's thumbnails.
+    full: FullPool,
+    /// Open lightbox windows. Dropping one drops the last `Arc`, which drops
+    /// its cloned `TextureHandle` and frees that texture.
+    lightboxes: Vec<Lightbox>,
+    /// Serial for the next lightbox. It only ever counts up, so two windows on
+    /// one file never share a viewport id.
+    next_lightbox_id: u64,
 }
 
 impl ViewerApp {
     pub fn new(cc: &eframe::CreationContext<'_>, initial_target: Option<PathBuf>) -> Self {
+        configure_style(&cc.egui_ctx);
         let pins = cc
             .storage
             .and_then(|storage| eframe::get_value::<Vec<Pin>>(storage, PINS_STORAGE_KEY))
@@ -259,6 +319,7 @@ impl ViewerApp {
             pinned_only: false,
             sort: None,
             visible: Vec::new(),
+            visible_paths: Arc::from(Vec::new()),
             matches: HashMap::new(),
             needs_refresh: false,
             force_tree_expanded: None,
@@ -270,6 +331,9 @@ impl ViewerApp {
             failed_thumbs: HashSet::new(),
             flash: None,
             pending_copy: None,
+            full: FullPool::new(cc.egui_ctx.clone()),
+            lightboxes: Vec::new(),
+            next_lightbox_id: 0,
         };
         // A command-line path wins; otherwise reopen the last folder.
         let startup_target = initial_target.or_else(|| {
@@ -399,6 +463,11 @@ impl ViewerApp {
         if let Some((column, ascending)) = self.sort {
             self.sort_visible(column, ascending);
         }
+        self.visible_paths = self
+            .visible
+            .iter()
+            .map(|&idx| self.images[idx].path.clone())
+            .collect();
 
         let selection_visible = self
             .selected
@@ -440,7 +509,7 @@ impl ViewerApp {
         }
     }
 
-    fn apply_actions(&mut self, actions: UiActions) {
+    fn apply_actions(&mut self, ctx: &egui::Context, actions: UiActions) {
         if let Some(idx) = actions.select {
             self.selected = Some(idx);
         }
@@ -476,6 +545,13 @@ impl ViewerApp {
                 self.needs_refresh = true;
             }
         }
+        if let Some(widths) = actions.column_widths {
+            for (key, width) in widths {
+                if self.settings.column_widths.get(&key) != Some(&width) {
+                    _ = self.settings.column_widths.insert(key, width);
+                }
+            }
+        }
         if let Some(idx) = actions.unpin
             && idx < self.pins.len()
         {
@@ -503,9 +579,17 @@ impl ViewerApp {
         if actions.cancel_rename {
             self.rename = None;
         }
+        if let Some((idx, enabled)) = actions.set_pin_copy
+            && idx < self.pins.len()
+        {
+            self.pins[idx].copy = Some(enabled);
+        }
         if let Some((label, content)) = actions.copy {
             self.flash = Some((format!("Copied {label}"), Instant::now()));
             self.pending_copy = Some(content);
+        }
+        if let Some(idx) = actions.open_lightbox {
+            self.open_lightbox(ctx, idx);
         }
         if let Some(expanded) = actions.set_tree_expanded {
             self.force_tree_expanded = Some(expanded);
@@ -537,6 +621,257 @@ impl ViewerApp {
                 .pick_files()
         {
             self.open_files(files);
+        }
+    }
+
+    // ---- lightbox windows ----
+
+    /// Opens a lightbox for `index`, or refuses past the cap with a flash. The
+    /// window is handed the filtered list as it stands now, so a later search
+    /// or re-sort cannot move it.
+    fn open_lightbox(&mut self, ctx: &egui::Context, index: usize) {
+        if !lightbox::can_open(self.lightboxes.len(), MAX_LIGHTBOXES) {
+            self.flash = Some((
+                format!("{MAX_LIGHTBOXES} lightbox windows already open"),
+                Instant::now(),
+            ));
+            return;
+        }
+        let Some(entry) = self.images.get(index) else {
+            return;
+        };
+        let detail = self.lightbox_detail(entry);
+        let nav = LightboxNav {
+            paths: Arc::clone(&self.visible_paths),
+            // `visible_paths` is built from `visible` in that same order, so a
+            // listed image sits at one position in both.
+            cursor: self
+                .visible
+                .iter()
+                .position(|&visible_idx| visible_idx == index)
+                .unwrap_or(0),
+        };
+        // Cloning the handle retains the texture, so the `MAX_TEXTURES` sweep
+        // dropping the map entry can never blank an open lightbox.
+        let texture = self.textures.get(&detail.path).cloned();
+        let id = LightboxId(self.next_lightbox_id);
+        self.next_lightbox_id += 1;
+        let source_size = detail.source_size;
+        let path = detail.path.clone();
+        self.lightboxes.push(Lightbox {
+            id,
+            shared: Arc::new(Mutex::new(LightboxShared {
+                texture,
+                detail,
+                status: LoadStatus::Loading,
+                decoded_size: [0, 0],
+                scene_rect: egui::Rect::ZERO,
+                pending_view: None,
+                fit_mode: true,
+                zoom: 1.0,
+                nav,
+                nav_request: None,
+                copied: None,
+                close_requested: false,
+            })),
+        });
+        self.full
+            .request(id, path, source_size, Self::texture_side_limit(ctx));
+    }
+
+    /// What a lightbox window shows about one listed image, strip included.
+    fn lightbox_detail(&self, entry: &ImageEntry) -> LightboxDetail {
+        let candidates = strip_candidates(entry, &self.pins, self.settings.comfyui_titles);
+        LightboxDetail {
+            path: entry.path.clone(),
+            file_name: entry.file_name.clone(),
+            source_size: [entry.width, entry.height],
+            file_size: entry.file_size,
+            strip: lightbox::build_strip(
+                &candidates,
+                lightbox::MAX_STRIP_ITEMS,
+                lightbox::MAX_STRIP_CHARS,
+            ),
+        }
+    }
+
+    /// [`Self::lightbox_detail`] for a path a window navigated to. A frozen
+    /// list outlives the scan that produced it, and the file itself still
+    /// displays, so a path the app no longer lists falls back to its name.
+    fn lightbox_detail_for_path(&self, path: &Path) -> LightboxDetail {
+        match self.images.iter().find(|entry| entry.path == path) {
+            Some(entry) => self.lightbox_detail(entry),
+            None => LightboxDetail {
+                file_name: path
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_default(),
+                path: path.to_path_buf(),
+                source_size: [0, 0],
+                file_size: 0,
+                strip: Vec::new(),
+            },
+        }
+    }
+
+    /// The largest texture side the driver accepts, held under the guard the
+    /// decoder enforces. The worker has no context, so this is read here.
+    fn texture_side_limit(ctx: &egui::Context) -> u32 {
+        ctx.input(|input| input.max_texture_side)
+            .min(full::TEXTURE_SIDE_GUARD as usize) as u32
+    }
+
+    /// Drops every lightbox whose window asked to close, releases the decode
+    /// each one had reserved, then moves the survivors that asked to navigate.
+    fn sync_lightboxes(&mut self, ctx: &egui::Context) {
+        let closed: Vec<LightboxId> = self
+            .lightboxes
+            .iter()
+            .filter(|lightbox| {
+                // The guard drops at the end of this expression, before
+                // `retain` drops the lightbox, so nothing is freed under its
+                // own lock.
+                lightbox
+                    .shared
+                    .lock()
+                    .expect("lightbox state poisoned")
+                    .close_requested
+            })
+            .map(|lightbox| lightbox.id)
+            .collect();
+        if !closed.is_empty() {
+            self.lightboxes
+                .retain(|lightbox| !closed.contains(&lightbox.id));
+            for id in closed {
+                self.full.forget(id);
+            }
+        }
+        self.apply_lightbox_nav(ctx);
+    }
+
+    /// Moves each window that asked for a step onto its new image: new detail,
+    /// cleared texture, fresh decode. Each one is woken explicitly, because the
+    /// child pass that wrote the request has already finished and the window
+    /// would otherwise paint the old image for the whole length of the decode.
+    fn apply_lightbox_nav(&mut self, ctx: &egui::Context) {
+        // The snapshot travels with the request: the detail below is built
+        // outside the lock, and the window's own next pass may run in between.
+        let steps: Vec<(LightboxId, Arc<[PathBuf]>, usize)> = self
+            .lightboxes
+            .iter()
+            .filter_map(|lightbox| {
+                let mut state = lightbox.shared.lock().expect("lightbox state poisoned");
+                let cursor = state.nav_request.take()?;
+                Some((lightbox.id, Arc::clone(&state.nav.paths), cursor))
+            })
+            .collect();
+        if steps.is_empty() {
+            return;
+        }
+
+        let max_side = Self::texture_side_limit(ctx);
+        for (id, paths, cursor) in steps {
+            // A zero step is the clamp: it answers `None` only for an empty
+            // list, which is the one case with nothing to index.
+            let Some(cursor) = lightbox::step_cursor(cursor, paths.len(), 0) else {
+                continue;
+            };
+            let path = paths[cursor].clone();
+            let detail = self.lightbox_detail_for_path(&path);
+            let source_size = detail.source_size;
+            let Some(lightbox) = self.lightboxes.iter().find(|open| open.id == id) else {
+                continue;
+            };
+            let shared = Arc::clone(&lightbox.shared);
+            {
+                let mut state = shared.lock().expect("lightbox state poisoned");
+                state.detail = detail;
+                state.nav.cursor = cursor;
+                // Dropping the old texture is what puts the spinner up on the
+                // window's next pass rather than when the decode lands.
+                state.texture = None;
+                state.decoded_size = [0, 0];
+                state.status = LoadStatus::Loading;
+                state.pending_view = Some(ViewCommand::Fit);
+                state.fit_mode = true;
+            }
+            self.full.request(id, path, source_size, max_side);
+            ctx.request_repaint_of(id.viewport_id());
+        }
+    }
+
+    /// Hands each finished decode to the window that asked for it. A result
+    /// whose window has closed, or whose path that window no longer wants, is
+    /// dropped.
+    fn poll_full(&mut self, ctx: &egui::Context) {
+        for result in self.full.poll() {
+            let Some(lightbox) = self.lightboxes.iter().find(|open| open.id == result.id) else {
+                continue;
+            };
+            let shared = Arc::clone(&lightbox.shared);
+            let wanted = shared
+                .lock()
+                .expect("lightbox state poisoned")
+                .detail
+                .path
+                .clone();
+            if wanted != result.path {
+                continue;
+            }
+            // Upload outside the lock: a child pass blocks on this same mutex,
+            // and `load_texture` is the slow part.
+            let (texture, decoded_size, status) = match result.outcome {
+                FullOutcome::Superseded => continue,
+                FullOutcome::Ready { image, size } => (
+                    Some(ctx.load_texture(
+                        format!("lightbox-{}", result.id.0),
+                        image,
+                        TextureOptions::LINEAR,
+                    )),
+                    size,
+                    LoadStatus::Ready,
+                ),
+                FullOutcome::Refused(message) => (None, [0, 0], LoadStatus::Refused(message)),
+                FullOutcome::Failed(message) => (None, [0, 0], LoadStatus::Failed(message)),
+            };
+            {
+                let mut state = shared.lock().expect("lightbox state poisoned");
+                if let Some(texture) = texture {
+                    state.texture = Some(texture);
+                    state.decoded_size = decoded_size;
+                    // The decode replaces a stand-in thumbnail, so the window
+                    // starts over from a fit rather than keeping that view.
+                    state.pending_view = Some(ViewCommand::Fit);
+                    state.fit_mode = true;
+                }
+                state.status = status;
+            }
+            ctx.request_repaint_of(result.id.viewport_id());
+        }
+    }
+
+    /// Re-registers every surviving lightbox. A window not registered in a
+    /// pass is destroyed at the end of it, so this must run every frame.
+    fn show_lightboxes(&self, ctx: &egui::Context) {
+        for lightbox in &self.lightboxes {
+            // Clone the title and drop the guard first: under the embedded
+            // fallback `show_viewport_deferred` runs the callback inline, and
+            // the callback locks this same mutex.
+            let title = lightbox
+                .shared
+                .lock()
+                .expect("lightbox state poisoned")
+                .detail
+                .file_name
+                .clone();
+            let shared = Arc::clone(&lightbox.shared);
+            ctx.show_viewport_deferred(
+                lightbox.id.viewport_id(),
+                egui::ViewportBuilder::default()
+                    .with_title(title)
+                    .with_inner_size(lightbox::INITIAL_SIZE),
+                move |ui, class| lightbox::lightbox_ui(ui, class, &shared),
+            );
         }
     }
 
@@ -607,18 +942,50 @@ fn compare_values(a: &str, b: &str) -> Ordering {
     }
 }
 
-fn single_line(text: &str, max_chars: usize) -> String {
+/// Leading `max_chars` characters, with an ellipsis when anything was cut.
+fn excerpt(text: &str, max_chars: usize) -> String {
     let mut chars = text.chars();
-    let mut out = String::new();
-    for c in chars.by_ref().take(max_chars) {
-        out.push(if c == '\n' || c == '\r' { ' ' } else { c });
-    }
+    let mut out: String = chars.by_ref().take(max_chars).collect();
     // One pass: the iterator is left just past the kept characters, so a
     // remaining character means the text was truncated.
     if chars.next().is_some() {
         out.push('…');
     }
     out
+}
+
+/// Excerpt for a single-line (truncating) label, where a line break would
+/// otherwise end the visible text early.
+pub fn single_line(text: &str, max_chars: usize) -> String {
+    excerpt(text, max_chars).replace(['\n', '\r'], " ")
+}
+
+/// Characters of the monospace text style that fit in `width`, plus slack so
+/// the label's own truncation places the ellipsis. Without this cap a
+/// multi-kilobyte prompt would be laid out in full to show one line of it.
+fn fitting_chars(ui: &Ui, width: f32) -> usize {
+    let font = egui::TextStyle::Monospace.resolve(ui.style());
+    // A zero width means the font has no '0' glyph. 1pt per character then
+    // caps generously instead of to nothing.
+    let glyph = ui
+        .ctx()
+        .fonts_mut(|fonts| fonts.glyph_width(&font, '0'))
+        .max(1.0);
+    // An unbounded container would make `width` infinite, and `as usize`
+    // saturates rather than overflowing, so the clamp is what bounds layout.
+    ((width.max(0.0) / glyph).ceil() as usize)
+        .saturating_add(8)
+        .min(MAX_VALUE_CHARS)
+}
+
+/// Storage key for the Name column's width. The `col:` and `pin:` namespaces
+/// keep a pin whose pattern is literally "name" from claiming this entry.
+const NAME_COLUMN_KEY: &str = "col:name";
+
+/// Storage key for a pin column's width. Keyed by pattern, not position, so a
+/// width follows its pin through a reorder.
+fn pin_column_key(pin: &Pin) -> String {
+    format!("pin:{}", pin.pattern.to_lowercase())
 }
 
 /// Display form of a pin: an explicit label wins; otherwise bare keys show
@@ -634,8 +1001,28 @@ fn pin_label(pin: &Pin) -> String {
     }
 }
 
+/// The lightbox strip's input: one entry per (pin, match) pair in
+/// pin-then-document order, each carrying its pin's copy flag.
+/// [`lightbox::build_strip`] is what drops the copy-disabled ones, so the flag
+/// travels with the value rather than being filtered here.
+fn strip_candidates(
+    entry: &ImageEntry,
+    pins: &[Pin],
+    use_titles: bool,
+) -> Vec<(String, bool, String)> {
+    let mut candidates = Vec::new();
+    for pin in pins {
+        let label = pin_label(pin);
+        let copies = pin_copies(pin);
+        for row in entry.rows_for_pin(&pin.pattern, pin.mode, use_titles) {
+            candidates.push((label.clone(), copies, row.value.clone()));
+        }
+    }
+    candidates
+}
+
 /// Full-value hover text, capped so multi-kilobyte prompts don't fill the
-/// screen; the copy actions always carry the complete value.
+/// screen. The copy actions always carry the complete value.
 fn tooltip_excerpt(value: &str) -> String {
     const MAX_CHARS: usize = 1200;
     let total = value.chars().count();
@@ -643,7 +1030,23 @@ fn tooltip_excerpt(value: &str) -> String {
         return value.to_string();
     }
     let head: String = value.chars().take(MAX_CHARS).collect();
-    format!("{head}…\n\n({} more characters — copy for the full value)", total - MAX_CHARS)
+    format!("{head}…\n\n({} more characters)", total - MAX_CHARS)
+}
+
+/// Widens the hovered scroll bar and lengthens its handle, since egui's
+/// defaults (10pt wide, 12pt minimum handle) are hard to see and hard to hit.
+/// The bar also reserves its own width, because egui senses it over the full
+/// `bar_width` even while painting the dormant 2pt sliver, and an overlapping
+/// strip would swallow clicks on the value labels underneath. Space is
+/// reserved only while an area is actually scrollable.
+fn configure_style(ctx: &egui::Context) {
+    ctx.all_styles_mut(|style| {
+        let scroll = &mut style.spacing.scroll;
+        scroll.bar_width = 16.0;
+        scroll.floating_allocated_width = 16.0;
+        // egui's own style editor accepts up to 32.
+        scroll.handle_min_length = 32.0;
+    });
 }
 
 /// Stable color per match ordinal, so "first cfg" and "second cfg" (e.g.
@@ -665,6 +1068,15 @@ impl eframe::App for ViewerApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         let force_tree = self.force_tree_expanded.take();
+
+        // Lightbox frame order is fixed: `sync_lightboxes` here, then the
+        // panels, then `apply_actions`, then `show_lightboxes` last. Syncing
+        // first means a lightbox closed this frame is simply not re-registered,
+        // so egui destroys its window at the end of this same pass. Applying
+        // actions before showing means a lightbox opened by this frame's click
+        // is registered in this same pass, instead of waiting for an unrelated
+        // repaint that nothing schedules.
+        self.sync_lightboxes(&ctx);
 
         self.poll_scanner();
 
@@ -694,6 +1106,8 @@ impl eframe::App for ViewerApp {
                 evict_stale_textures(&mut self.texture_order, &mut self.textures, MAX_TEXTURES);
             }
         }
+
+        self.poll_full(&ctx);
 
         // Dropped files.
         let dropped: Vec<PathBuf> = ctx.input(|input| {
@@ -767,17 +1181,18 @@ impl eframe::App for ViewerApp {
                 .collapsible(false)
                 .resizable(false)
                 .show(&ctx, |ui| {
+                    ui.set_max_width(320.0);
                     changed |= ui
                         .checkbox(&mut self.settings.comfyui_titles, "ComfyUI title pins")
                         .changed();
-                    ui.set_max_width(320.0);
                     _ = ui.label(
                         RichText::new(
-                            "Pins can match nodes by their _meta.title (substring) and \
-                             show that node's input values — stable across workflows \
-                             whose node ids differ. Pinning a titled value from the \
-                             tree pins the title; typed pins match keys and titles. \
-                             Has no effect on files without ComfyUI structure.",
+                            "A pin can match a ComfyUI node by part of its title and \
+                             show that node's input values. Node titles stay the same \
+                             across workflows where node ids differ. Typed pins match \
+                             keys and titles. Pin a titled value from the tree to pin \
+                             its node title. Files without ComfyUI structure are \
+                             unaffected.",
                         )
                         .weak()
                         .small(),
@@ -790,7 +1205,8 @@ impl eframe::App for ViewerApp {
             }
         }
 
-        self.apply_actions(actions);
+        self.apply_actions(&ctx, actions);
+        self.show_lightboxes(&ctx);
         if let Some(content) = self.take_pending_copy() {
             ctx.copy_text(content);
         }
@@ -844,6 +1260,7 @@ impl ViewerApp {
                     PinMode::Key => "key",
                     PinMode::Auto => "key or node title",
                 };
+                let copies = pin_copies(pin);
                 let chip = ui.small_button(pin_label(pin)).on_hover_text(format!(
                     "{}  ({mode_note})\n\nColumn in the table, in this order.\nRight-click to rename, reorder, or unpin.",
                     pin.pattern,
@@ -851,6 +1268,15 @@ impl ViewerApp {
                 _ = chip.context_menu(|ui| {
                     if ui.button("✏ Rename…").clicked() {
                         actions.start_rename = Some(idx);
+                        ui.close();
+                    }
+                    let copy_entry = if copies {
+                        "📋 Hide copy button"
+                    } else {
+                        "📋 Show copy button"
+                    };
+                    if ui.button(copy_entry).clicked() {
+                        actions.set_pin_copy = Some((idx, !copies));
                         ui.close();
                     }
                     if ui.button("◀ Move left").clicked() {
@@ -982,10 +1408,17 @@ impl ViewerApp {
             actions.used_thumbs.push(preview_path.clone());
             let available = ui.available_width();
             _ = ui.vertical_centered(|ui| {
-                _ = ui.add(
-                    egui::Image::new(texture)
-                        .max_size(egui::vec2(available, 240.0)),
-                );
+                let preview = ui
+                    .add(
+                        egui::Image::new(texture)
+                            .max_size(egui::vec2(available, 240.0))
+                            .sense(Sense::click()),
+                    )
+                    .on_hover_cursor(egui::CursorIcon::PointingHand)
+                    .on_hover_text("Open in a window");
+                if preview.clicked() {
+                    actions.open_lightbox = Some(selected);
+                }
             });
         } else {
             actions.request_thumbs.push(preview_path.clone());
@@ -1136,15 +1569,37 @@ impl ViewerApp {
         sort: Option<(SortColumn, bool)>,
         actions: &mut UiActions,
     ) {
+        // Inputs: the saved width per column, and a layout id that changes with
+        // the pin set. egui_extras discards its own widths on any column-set
+        // change, so the salt makes it start fresh from the saved widths rather
+        // than from a stale set it would otherwise reuse after a copy toggle.
+        let saved = &self.settings.column_widths;
+        let layout_id: String = self
+            .pins
+            .iter()
+            .map(|pin| format!("{}{}", pin_copies(pin) as u8, pin_column_key(pin)))
+            .collect::<Vec<_>>()
+            .join("\u{1f}");
+        let mut column_keys: Vec<String> = Vec::with_capacity(self.pins.len() + 1);
+        column_keys.push(NAME_COLUMN_KEY.to_string());
+
+        let name_width = saved.get(NAME_COLUMN_KEY).copied().unwrap_or(230.0);
         let mut builder = TableBuilder::new(ui)
+            .id_salt(("image_table", layout_id))
             .striped(true)
             .sense(Sense::click())
             .cell_layout(egui::Layout::left_to_right(Align::Center))
             .column(Column::exact(THUMB_CELL + 8.0))
-            .column(Column::initial(230.0).at_least(120.0).clip(true).resizable(true));
-        for _ in &self.pins {
+            .column(Column::initial(name_width).at_least(120.0).clip(true).resizable(true));
+        for pin in &self.pins {
+            let key = pin_column_key(pin);
+            // A frameless copy button plus a value does not fit 110pt. A width
+            // the user chose outranks either default.
+            let default = if pin_copies(pin) { 150.0 } else { 110.0 };
+            let width = saved.get(&key).copied().unwrap_or(default);
+            column_keys.push(key);
             builder = builder
-                .column(Column::initial(110.0).at_least(60.0).clip(true).resizable(true));
+                .column(Column::initial(width).at_least(60.0).clip(true).resizable(true));
         }
         if has_search {
             builder = builder.column(Column::remainder().clip(true));
@@ -1166,6 +1621,14 @@ impl ViewerApp {
                 }
             })
             .body(|body| {
+                // Reflects the previous frame's drag, which is soon enough to
+                // outlive a restart and invisible to the user.
+                actions.column_widths = Some(
+                    column_keys
+                        .into_iter()
+                        .zip(body.widths().iter().skip(1).copied())
+                        .collect(),
+                );
                 body.rows(ROW_HEIGHT, self.visible.len(), |mut row| {
                     let image_idx = self.visible[row.index()];
                     let entry = &self.images[image_idx];
@@ -1174,10 +1637,21 @@ impl ViewerApp {
                     _ = row.col(|ui| {
                         match self.textures.get(&entry.path) {
                             Some(texture) => {
-                                _ = ui.add(
-                                    egui::Image::new(texture)
-                                        .max_size(egui::vec2(THUMB_CELL, THUMB_CELL)),
-                                );
+                                let thumb = ui
+                                    .add(
+                                        egui::Image::new(texture)
+                                            .max_size(egui::vec2(THUMB_CELL, THUMB_CELL))
+                                            .sense(Sense::click()),
+                                    )
+                                    .on_hover_cursor(egui::CursorIcon::PointingHand)
+                                    .on_hover_text("Open in a window");
+                                // A clickable image takes the hit-test from the
+                                // row, so the row's own click never fires here
+                                // and this must select the row itself.
+                                if thumb.clicked() {
+                                    actions.open_lightbox = Some(image_idx);
+                                    actions.select = Some(image_idx);
+                                }
                                 actions.used_thumbs.push(entry.path.clone());
                             }
                             None => {
@@ -1317,16 +1791,23 @@ fn pin_cell_ui(
         _ = ui.label(RichText::new("—").weak());
         return;
     }
+    let copies = pin_copies(pin);
     for (i, row) in matches.iter().take(MAX_CELL_MATCHES).enumerate() {
         if i > 0 {
             _ = ui.label(RichText::new("·").weak());
         }
+        if copies
+            && ui
+                .add(Button::new("📋").small().frame(false))
+                .on_hover_text("Copy full value")
+                .clicked()
+        {
+            actions.copy = Some((pin_label(pin), row.value.clone()));
+        }
         let color = ordinal_color(ui, i);
-        let response = ui
-            .add(
-                Label::new(RichText::new(single_line(&row.value, 28)).monospace().color(color))
-                    .sense(Sense::click()),
-            )
+        let text = single_line(&row.value, fitting_chars(ui, ui.available_width()));
+        _ = ui
+            .add(Label::new(RichText::new(text).monospace().color(color)))
             // Built inside the hover closure: every visible cell would
             // otherwise format every match on every frame.
             .on_hover_ui(|ui| {
@@ -1336,13 +1817,9 @@ fn pin_cell_ui(
                     .enumerate()
                     .map(|(n, r)| format!("{}. {} = {}", n + 1, r.path, single_line(&r.value, 200)))
                     .collect::<Vec<_>>()
-                    .join("\n")
-                    + "\n\n(click a value to copy it)";
+                    .join("\n");
                 _ = ui.label(tooltip);
             });
-        if response.clicked() {
-            actions.copy = Some((pin_label(pin), row.value.clone()));
-        }
     }
     if matches.len() > MAX_CELL_MATCHES {
         _ = ui.label(RichText::new(format!("+{}", matches.len() - MAX_CELL_MATCHES)).weak());
@@ -1395,7 +1872,7 @@ fn pinned_list_ui(
                     let response = ui
                         .add(
                             Label::new(
-                                RichText::new(single_line(&row.value, 300))
+                                RichText::new(excerpt(&row.value, MAX_VALUE_CHARS))
                                     .monospace()
                                     .color(color),
                             )
@@ -1703,6 +2180,7 @@ fn leaf_row_ui(
                     pattern: path.to_string(),
                     label: None,
                     mode: PinMode::Key,
+                    copy: None,
                 },
                 // A title pin only ever resolves `inputs.*` rows, so create one
                 // only where the indicator and hover text say so (`title_lc`);
@@ -1713,6 +2191,7 @@ fn leaf_row_ui(
                     pattern: path.to_string(),
                     label: maybe_title,
                     mode: PinMode::Key,
+                    copy: None,
                 },
             };
             actions.toggle_pin = Some(target);
@@ -1756,6 +2235,7 @@ fn leaf_row_ui(
                     pattern: path.to_string(),
                     label: if path_pinned { None } else { node_title },
                     mode: PinMode::Key,
+                    copy: None,
                 });
                 ui.close();
             }
@@ -1768,9 +2248,10 @@ fn leaf_row_ui(
         {
             actions.copy = Some((key.to_string(), value.to_string()));
         }
+        let text = single_line(value, fitting_chars(ui, ui.available_width()));
         let response = ui
             .add(
-                Label::new(RichText::new(single_line(value, 120)).monospace())
+                Label::new(RichText::new(text).monospace())
                     .truncate()
                     .sense(Sense::click()),
             )
@@ -1798,7 +2279,8 @@ fn value_label_ui(ui: &mut Ui, key: &str, value: &str, actions: &mut UiActions) 
     }
     let response = ui
         .add(
-            Label::new(RichText::new(single_line(value, 300)).monospace())
+            Label::new(RichText::new(excerpt(value, MAX_VALUE_CHARS)).monospace())
+                .wrap()
                 .sense(Sense::click()),
         )
         .on_hover_text("Click to copy full value");
@@ -1821,6 +2303,35 @@ mod tests {
             order.push_back(path);
         }
         (order, live)
+    }
+
+    #[test]
+    fn a_pin_named_name_cannot_claim_the_name_column_width() {
+        // Both keys share one map, so the namespaces are what keep a pin
+        // pattern from overwriting a fixed column's width.
+        assert_ne!(pin_column_key(&Pin::key("name")), NAME_COLUMN_KEY);
+    }
+
+    #[test]
+    fn a_pin_column_width_key_ignores_pattern_case() {
+        // Pin matching is case-insensitive, so two spellings of one pin must
+        // not end up with two different saved widths.
+        assert_eq!(pin_column_key(&Pin::key("CFG")), pin_column_key(&Pin::key("cfg")));
+    }
+
+    #[test]
+    fn excerpt_marks_only_a_real_truncation() {
+        // The ellipsis must track whether anything was actually cut, not
+        // whether the text reached the cap.
+        assert_eq!(excerpt("abcd", 4), "abcd");
+        assert_eq!(excerpt("abcde", 4), "abcd…");
+        assert_eq!(excerpt("", 0), "");
+        assert_eq!(excerpt("a", 0), "…");
+    }
+
+    #[test]
+    fn single_line_flattens_line_breaks() {
+        assert_eq!(single_line("a\r\nb", 10), "a  b");
     }
 
     #[test]
@@ -1868,5 +2379,143 @@ mod tests {
         let (mut order, live) = cache(2);
         touch_texture_order(&mut order, &live, &[PathBuf::from("gone.png")]);
         assert_eq!(order.len(), 2);
+    }
+
+    #[test]
+    fn copy_defaults_on_for_prompt_and_seed_labels() {
+        assert!(default_copy_enabled("seed"));
+        assert!(default_copy_enabled("noise_seed"));
+        assert!(default_copy_enabled("Positive Prompt"));
+        assert!(default_copy_enabled("PROMPT"));
+    }
+
+    #[test]
+    fn copy_defaults_off_for_every_other_label() {
+        assert!(!default_copy_enabled("steps"));
+        assert!(!default_copy_enabled("cfg"));
+        assert!(!default_copy_enabled("sampler_name"));
+        // The rule reads the displayed label, so an exact path inside the
+        // `prompt` chunk shows only its final segment and stays off.
+        assert!(!default_copy_enabled("⌖ text"));
+    }
+
+    #[test]
+    fn an_explicit_copy_choice_beats_the_default() {
+        let mut prompt_pin = Pin::key("prompt");
+        let mut cfg_pin = Pin::key("cfg");
+        assert!(pin_copies(&prompt_pin));
+        assert!(!pin_copies(&cfg_pin));
+        prompt_pin.copy = Some(false);
+        cfg_pin.copy = Some(true);
+        assert!(!pin_copies(&prompt_pin));
+        assert!(pin_copies(&cfg_pin));
+    }
+
+    #[test]
+    fn only_the_seed_default_pins_copy() {
+        let pins = default_pins();
+        let copying: Vec<&str> = pins
+            .iter()
+            .filter(|pin| pin_copies(pin))
+            .map(|pin| pin.pattern.as_str())
+            .collect();
+        assert_eq!(copying, vec!["seed", "noise_seed"]);
+    }
+
+    /// One ComfyUI-shaped image: a titled prompt node plus two `cfg` values.
+    /// Built through the public construction path, so `file.*` rows are
+    /// present here exactly as they are at runtime.
+    fn comfy_entry() -> ImageEntry {
+        let text = r#"{"6": {"inputs": {"value": "a cat"}, "_meta": {"title": "Positive Prompt"}},
+             "9": {"inputs": {"cfg": 4.5}}, "12": {"inputs": {"cfg": 1.0}}}"#;
+        ImageEntry::from_parts(
+            PathBuf::from("test.png"),
+            crate::model::FileMeta {
+                size: 0,
+                created: None,
+                modified: None,
+                width: 8,
+                height: 8,
+            },
+            vec![crate::chunks::TextChunk {
+                keyword: "prompt".to_string(),
+                text: text.to_string(),
+            }],
+        )
+    }
+
+    /// The three pins the strip has to tell apart: copy-enabled with one
+    /// match, copy-disabled with two, and copy-enabled with none.
+    fn strip_pins() -> Vec<Pin> {
+        vec![
+            Pin::title("Positive Prompt".to_string()),
+            Pin::key("cfg"),
+            Pin::key("seed"),
+        ]
+    }
+
+    #[test]
+    fn a_candidate_is_one_pin_match_pair_in_pin_then_document_order() {
+        let entry = comfy_entry();
+        let candidates = strip_candidates(&entry, &strip_pins(), true);
+        let listed: Vec<(&str, bool, &str)> = candidates
+            .iter()
+            .map(|(label, copies, value)| (label.as_str(), *copies, value.as_str()))
+            .collect();
+        assert_eq!(
+            listed,
+            vec![
+                ("Positive Prompt", true, "a cat"),
+                ("cfg", false, "4.5"),
+                ("cfg", false, "1.0"),
+            ]
+        );
+    }
+
+    #[test]
+    fn only_the_copy_enabled_pins_reach_the_strip() {
+        // The bar never shows a bare label with nothing after it, so a pin
+        // with no match contributes nothing either.
+        let entry = comfy_entry();
+        let candidates = strip_candidates(&entry, &strip_pins(), true);
+        let strip = lightbox::build_strip(
+            &candidates,
+            lightbox::MAX_STRIP_ITEMS,
+            lightbox::MAX_STRIP_CHARS,
+        );
+        let listed: Vec<(&str, &str)> = strip
+            .iter()
+            .map(|item| (item.label.as_str(), item.value.as_str()))
+            .collect();
+        assert_eq!(listed, vec![("Positive Prompt", "a cat")]);
+    }
+
+    #[test]
+    fn turning_a_pins_copy_button_off_takes_it_off_the_strip() {
+        let entry = comfy_entry();
+        let mut pins = vec![Pin::title("Positive Prompt".to_string())];
+        assert_eq!(strip_candidates(&entry, &pins, true).len(), 1);
+        let strip_on = lightbox::build_strip(
+            &strip_candidates(&entry, &pins, true),
+            lightbox::MAX_STRIP_ITEMS,
+            lightbox::MAX_STRIP_CHARS,
+        );
+        assert_eq!(strip_on.len(), 1);
+
+        pins[0].copy = Some(false);
+        let strip_off = lightbox::build_strip(
+            &strip_candidates(&entry, &pins, true),
+            lightbox::MAX_STRIP_ITEMS,
+            lightbox::MAX_STRIP_CHARS,
+        );
+        assert!(strip_off.is_empty());
+    }
+
+    #[test]
+    fn a_pin_saved_without_the_copy_field_loads_as_unset() {
+        let stored = r#"{"pattern":"cfg","label":null,"mode":"Key"}"#;
+        let pin: Pin = serde_json::from_str(stored).expect("pre-copy pin should still parse");
+        assert_eq!(pin.copy, None);
+        assert_eq!(pin, Pin::key("cfg"));
     }
 }

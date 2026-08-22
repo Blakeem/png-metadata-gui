@@ -10,7 +10,9 @@
 mod app;
 mod cache;
 mod chunks;
+mod full;
 mod index;
+mod lightbox;
 mod model;
 mod scan;
 mod thumbs;

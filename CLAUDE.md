@@ -51,6 +51,12 @@ PNG chunk    →   flatten payload →  ImageEntry:      →  background  →  e
 reader           to MetaRow list    file.* rows +       thumbnail      table, tree,
 (seek-skips      (JSON tree or      chunk rows +        decode pool    pins, search,
 pixel data)      key=value text)    pin matching        (LRU capped)   find, settings
+                                                                          │
+                                            lightbox.rs (deferred viewport, one per window)
+                                              app.rs owns Vec<Lightbox> ──┘
+                                              parent ⇄ child share LightboxShared
+                                              behind a mutex (texture, detail,
+                                              close_requested)
 ```
 
 - `chunks.rs` — minimal PNG reader: IHDR dims + text chunks only, seeks past
@@ -62,7 +68,15 @@ pixel data)      key=value text)    pin matching        (LRU capped)   find, set
   pins/searches/sorts like tEXt data. Owns pin matching.
 - `thumbs.rs` — worker threads decode at ≤512px, send RGBA back for texture
   upload; every request produces exactly one result (even on failure) so the
-  pending counter stays accurate.
+  pending counter stays accurate. Sizing goes through `full::decode_size`,
+  the same clamp `full.rs` uses, which is what stops it enlarging images
+  under 512px.
+- `full.rs` — one worker decodes a lightbox's image at full resolution.
+  Keyed by `LightboxId`, not path, since two windows can show one file, and
+  the shared `wanted` map lets a later request for a window supersede an
+  earlier one. `decode_size` clamps to the texture-side guard and the
+  per-window pixel budget. Anything past the source-pixel cap is refused
+  before `image::open` allocates it.
 - `cache.rs` — per-folder metadata cache: gzip'd JSON, one file per folder
   (path-hash name) under `metadata-cache/` in the eframe storage dir
   (`%APPDATA%\PNG Metadata GUI\`). Stores raw text chunks + the
@@ -73,6 +87,10 @@ pixel data)      key=value text)    pin matching        (LRU capped)   find, set
   write is skipped).
 - `app.rs` — all UI. Widget closures collect `UiActions` per frame; mutations
   apply after rendering (never mutate app state inside a widget closure).
+- `lightbox.rs` — one image in its own OS window, as a deferred egui viewport.
+  `app.rs` holds the `Vec<Lightbox>`. Each entry shares an
+  `Arc<Mutex<LightboxShared>>` with its window callback, because that callback
+  outlives the frame that built it.
 - `assets/` — `icon.svg` (source of truth) → `icon.ico` + `icon-256.png`,
   regenerated with `tools/icon-forge` (standalone dev crate:
   `cargo run -- ../../assets/icon.svg out icon` from its dir). `build.rs`
@@ -109,11 +127,13 @@ pixel data)      key=value text)    pin matching        (LRU capped)   find, set
   only runs when strict parsing fails. Don't "simplify" it into a regex — it
   must not touch string contents.
 - **Pins persistence**: stored under a versioned key (`pins_v4`, a
-  `Vec<Pin { pattern, label, mode }>`; `pins_v3` stored bare pattern strings
-  and is migrated on load; `mode` is `#[serde(default)]` so pre-mode v4 data
-  still loads). Changing the default pin set or a field's meaning requires a
-  version bump; purely additive optional fields may use `serde(default)`
-  instead. Settings live under `settings_v1` with struct-level
+  `Vec<Pin { pattern, label, mode, copy }>`; `pins_v3` stored bare pattern
+  strings and is migrated on load; `mode` and `copy` are `#[serde(default)]`
+  so pre-mode and pre-copy v4 data still loads). `copy` is a purely additive
+  optional field, so it needed no version bump. `None` defers to
+  `default_copy_enabled`. Changing the default pin set or a field's meaning
+  requires a version bump; purely additive optional fields may use
+  `serde(default)` instead. Settings live under `settings_v1` with struct-level
   `serde(default)` for the same reason.
 - **Cache correctness**: `ImageEntry::from_parts` is the single construction
   path — a cache hit and a disk read must produce byte-identical rows. The
@@ -129,6 +149,24 @@ pixel data)      key=value text)    pin matching        (LRU capped)   find, set
   it (`jump_opens`), and scrolls there; a match inside `_meta` retargets to
   the owning node so the whole node opens. Enter cycles matches. The global
   search box stays a pure filter.
+- **Lightbox re-registration**: `show_lightboxes` must run on every
+  `ViewerApp::ui` pass. egui destroys any deferred viewport it does not see
+  registered during a pass, so an early return added to `ui()` would silently
+  close every lightbox window. The frame order is fixed: `sync_lightboxes` →
+  panels → `apply_actions` → `show_lightboxes`.
+- **A lightbox must never repaint continuously**: a child viewport that asks
+  for a repaint every pass starves the root of redraws, and the root is what
+  drains a window's close, its arrow keys, and its finished decodes. So an
+  animated `ui.spinner()` in a lightbox strands that window on the spinner and
+  refuses to close it. The loading state is a still label for that reason.
+  Transient full-rate repaints (a drag, a zoom readout change) are fine, since
+  the root resumes the moment they stop.
+- **Lightbox wake rule**: repaints are per viewport. A child window writing a
+  `LightboxShared` field the parent reads must follow it with
+  `request_repaint_of(ViewportId::ROOT)`, and the parent writing a field the
+  child reads must follow it with `request_repaint_of(id.viewport_id())`.
+  Without that the write sits unread until an unrelated event wakes the other
+  side.
 
 ## egui 0.36 API notes (differs from older docs/examples)
 

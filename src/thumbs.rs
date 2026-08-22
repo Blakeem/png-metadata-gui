@@ -8,6 +8,8 @@ use std::sync::{Arc, Mutex};
 
 use eframe::egui;
 
+use crate::full;
+
 pub const THUMB_MAX_DIM: u32 = 512;
 const WORKER_COUNT: usize = 3;
 
@@ -86,7 +88,15 @@ impl ThumbPool {
 
 fn decode_thumbnail(path: &Path) -> Option<egui::ColorImage> {
     let decoded = image::open(path).ok()?;
-    let thumb = decoded.thumbnail(THUMB_MAX_DIM, THUMB_MAX_DIM).to_rgba8();
+    let source = [decoded.width(), decoded.height()];
+    // `DynamicImage::thumbnail` enlarges anything under the box, which wasted
+    // memory and blurred small images. `decode_size` never enlarges.
+    let target = full::decode_size(source, THUMB_MAX_DIM, u64::MAX);
+    let thumb = if target == source {
+        decoded.into_rgba8()
+    } else {
+        decoded.thumbnail_exact(target[0], target[1]).into_rgba8()
+    };
     let size = [thumb.width() as usize, thumb.height() as usize];
     Some(egui::ColorImage::from_rgba_unmultiplied(size, thumb.as_raw()))
 }
